@@ -63,11 +63,34 @@ FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.title="Fedora bootc for Acer Googlebook 14 (Moonstone)"
 LABEL org.opencontainers.image.description="Depthcharge Slot B bootable Fedora bootc image for the Acer Googlebook 14 GP714-91N (board Moonstone / Google_Fatcat)"
 
-# Nothing to install: dracut, mkbootimg, kexec, sgdisk and zstd - everything the packer
-# needs - are already in the base image. keyd would belong here too, but Fedora 44 does not
-# package it (only the unrelated keydb), so the Vivaldi top row is handled by
-# 61-googlebook-moonstone.hwdb plus the EVIOCSKEYCODE pass in googlebook-gpu-init.
-# /etc/keyd/cros.conf still ships, so installing keyd from COPR later needs no changes.
+# The packer's toolchain. dracut, zstd, depmod, cpio and findmnt come from the base image,
+# but kexec and sgdisk are not guaranteed there - the base lives in another repository and
+# has already dropped them once, which smoke-googlebook.sh caught as "FAIL kexec available
+# / FAIL sgdisk available". They are hard dependencies of this layer, not of the base:
+#   kexec  (kexec-tools) - googlebook-pack-slotb's kernel handoff
+#   sgdisk (gdisk)       - googlebook-switch-slot and googlebook-restore-slotb, which flip
+#                          the Depthcharge priority/tries/successful attributes on
+#                          partitions 15 and 16
+# so install them here and let the layer stand on its own. Both are cheap and neither
+# pulls in a service: Fedora split kdump out of kexec-tools into kdump-utils, so
+# kexec-tools is just /usr/bin/kexec.
+#
+# keyd would belong here too, but Fedora 44 does not package it (only the unrelated
+# keydb), so the Vivaldi top row is handled by 61-googlebook-moonstone.hwdb plus the
+# EVIOCSKEYCODE pass in googlebook-gpu-init. /etc/keyd/cros.conf still ships, so
+# installing keyd from COPR later needs no changes.
+#
+# `dnf clean all` is not enough on its own: it leaves /run/dnf, /var/log/dnf5.log, the
+# per-repo countme files under /var/lib/dnf/repos and an ldconfig aux-cache behind, and
+# `bootc container lint` - the last step of this build - reports all four. The base image
+# lints clean, so without this the only lint warnings in the image would be ones this
+# layer added.
+RUN dnf -y install kexec-tools gdisk \
+    && dnf clean all \
+    && rm -rf /run/dnf /var/lib/dnf/repos \
+    && rm -f /var/log/dnf*.log /var/cache/ldconfig/aux-cache \
+    && command -v kexec >/dev/null \
+    && command -v sgdisk >/dev/null
 
 COPY --from=build /out/extra            /tmp/googlebook-mods/extra
 COPY --from=build /out/updates          /tmp/googlebook-mods/updates
