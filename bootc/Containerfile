@@ -26,6 +26,7 @@ FROM ${BASE_IMAGE} AS build
 RUN KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' kernel-core)" \
     && printf '%s' "$KVER" > /kver \
     && dnf -y install "kernel-devel-${KVER}" gcc make zlib-ng-compat-devel \
+    && mkdir -p /src \
     && dnf clean all
 
 COPY coreboot-mods   /src/coreboot-mods
@@ -84,11 +85,23 @@ COPY audio-mods      /usr/local/share/googlebook-dualboot/audio-mods
 COPY googleboot-menu /usr/local/share/googlebook-dualboot/googleboot-menu
 COPY docs            /usr/local/share/googlebook-dualboot/docs
 
-COPY --chmod=0644 bootc/configs/ /
-COPY --chmod=0755 bootc/files/   /
+# NOT `COPY --chmod=0644 bootc/configs/ /`. --chmod applies the mode to directories as well
+# as files, and not only to the directories it creates - every directory on the destination
+# path is chmod'ed too. Copying this tree to / with --chmod=0644 left /usr/lib, /usr/share,
+# /usr/lib/systemd/system, /usr/lib/udev, /usr/lib/dracut and /usr/share/alsa as mode 0644:
+# directories no non-root process can traverse. Nothing in the build notices, because root
+# bypasses the check via CAP_DAC_OVERRIDE - the build, `bootc container lint` and
+# smoke-googlebook.sh all passed on an image where gdm could not read /usr/share and
+# pipewire could not read the rt721+rt1320 UCM config this layer ships.
+#
+# Stage the trees instead; install-googlebook-layer.sh places the files with explicit modes,
+# creates only the directories that are actually missing, and asserts afterwards that every
+# directory it wrote into is still traversable.
+COPY bootc/configs/ /tmp/googlebook-stage/configs/
+COPY bootc/files/   /tmp/googlebook-stage/files/
 
 COPY --chmod=0755 bootc/install-googlebook-layer.sh /tmp/install-googlebook-layer.sh
 RUN /tmp/install-googlebook-layer.sh \
-    && rm -rf /tmp/install-googlebook-layer.sh /tmp/googlebook-mods
+    && rm -rf /tmp/install-googlebook-layer.sh /tmp/googlebook-mods /tmp/googlebook-stage
 
 RUN bootc container lint

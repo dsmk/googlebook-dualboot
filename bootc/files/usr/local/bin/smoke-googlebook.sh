@@ -79,6 +79,32 @@ check "staged Xe2 modprobe rules present" \
 check "/var/lib/googlebook tmpfiles entry present" \
   grep -q '/var/lib/googlebook' /usr/lib/tmpfiles.d/googlebook.conf
 
+# --- directories this image ships into must stay traversable by non-root -----------------
+# `COPY --chmod=0644 configs/ /` chmods directories as well as files, and not only the ones
+# it creates: it walks the destination path and leaves /usr/lib, /usr/share,
+# /usr/lib/systemd/system and friends at 0644. root is exempt (CAP_DAC_OVERRIDE), so an
+# image broken this way builds, lints and passes every root-run check while no user session
+# works on it - gdm cannot read /usr/share, pipewire cannot read the UCM config below.
+# Checked here as well as at build time because the base image is built from a separate
+# Containerfile that can reintroduce it underneath this layer at any time.
+untraversable=0
+for d in /usr /usr/lib /usr/lib/systemd /usr/lib/systemd/system /usr/lib/udev \
+         /usr/lib/udev/hwdb.d /usr/lib/dracut /usr/lib/dracut/dracut.conf.d \
+         /usr/lib/modprobe.d /usr/lib/modules-load.d /usr/lib/tmpfiles.d \
+         /usr/lib/modules /usr/lib/firmware /usr/share /usr/share/alsa \
+         /usr/local /usr/local/bin /usr/local/sbin /usr/local/share \
+         /etc /etc/yum.repos.d /etc/keyd; do
+  [ -d "$d" ] || continue
+  if [ -n "$(find "$d" -maxdepth 0 ! -perm -o=rx 2>/dev/null)" ]; then
+    echo "  FAIL $d is $(stat -c %A "$d") - not traversable by non-root"
+    untraversable=1
+    fail=1
+  fi
+done
+if [ "$untraversable" -eq 0 ]; then
+  echo "  ok   shipped directories traversable by non-root"
+fi
+
 # --- the toolkit entry points -----------------------------------------------------------
 for tool in googlebook-pack-slotb googlebook-restore-slotb googlebook-switch-slot \
             googlebook-sysroot-sync googlebook-slotb-sync googleboot-menu googleboot-scan \

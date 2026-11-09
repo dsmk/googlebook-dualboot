@@ -7,6 +7,51 @@ set -euxo pipefail
 
 KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' kernel-core)"
 TOOLKIT=/usr/local/share/googlebook-dualboot
+STAGE=/tmp/googlebook-stage
+
+# --- configs/ and files/, placed with explicit modes ----------------------------------
+# These used to arrive as `COPY --chmod=0644 bootc/configs/ /` and `--chmod=0755
+# bootc/files/ /`. --chmod applies the mode to directories too, including directories that
+# already exist on the destination path, so that left /usr/lib, /usr/share,
+# /usr/lib/systemd/system, /usr/lib/udev, /usr/lib/dracut and /usr/share/alsa at 0644 -
+# untraversable for anything not running as root, and therefore invisible to every check in
+# this build, which runs as root. Place the files by hand instead and create only the
+# directories that are genuinely missing.
+place_tree() {
+  local src=$1 mode=$2 rel
+  local -a dirs files
+  # sorted, so a parent is always created before its children
+  mapfile -t dirs  < <(cd "$src" && find . -mindepth 1 -type d -printf '%P\n' | sort)
+  mapfile -t files < <(cd "$src" && find . -type f -printf '%P\n')
+  for rel in "${dirs[@]}";  do [[ -d "/$rel" ]] || install -d -m0755 "/$rel"; done
+  for rel in "${files[@]}"; do install -m"$mode" "$src/$rel" "/$rel"; done
+}
+place_tree "$STAGE/configs" 0644
+place_tree "$STAGE/files"   0755
+
+# Every directory those files now live under, up to /, has to stay readable and traversable
+# by a non-root process. This is a repair as well as a guard: the base image ships /usr/lib
+# at 0644 from the identical --chmod mistake in its own Containerfile, so the Googlebook
+# image inherits the breakage even with this layer's copies fixed.
+mapfile -t ANCESTORS < <(
+  cd "$STAGE" && find configs files -type f -printf '%P\n' | while IFS= read -r rel; do
+    d=$(dirname "$rel")
+    while [[ "$d" != "." && "$d" != "/" ]]; do printf '/%s\n' "$d"; d=$(dirname "$d"); done
+  done | sort -u
+)
+chmod a+rX "${ANCESTORS[@]}"
+bad="$(find "${ANCESTORS[@]}" -maxdepth 0 ! -perm -o=rx -printf '%M %p\n')"
+[[ -z "$bad" ]] || { echo "FATAL: directories not traversable by non-root:" >&2
+                     echo "$bad" >&2; exit 1; }
+
+# The base image is built from its own Containerfile with the same `COPY --chmod=0644
+# configs/ /` mistake, so it arrives with directories already damaged. /usr/lib is on the
+# ancestor list above and gets repaired there; these two are not under anything this layer
+# ships into, so restore them to their stock fedora-bootc:44 modes by hand. 0644 on
+# /etc/sudoers.d also made it world-readable, which 0750 is specifically there to prevent.
+# Drop this block once the base image stops applying --chmod to a whole tree.
+chmod 0750 /etc/sudoers.d    # stock: drwxr-x---
+chmod 0755 /etc/yum.repos.d  # stock: drwxr-xr-x
 
 # --- out-of-tree modules built in the builder stage against this exact kernel ---------
 install -d -m0755 "/usr/lib/modules/${KVER}/extra" "/usr/lib/modules/${KVER}/updates"
