@@ -55,6 +55,14 @@ Description=GoogleBook Moonstone Graphical kexec Boot Menu
 DefaultDependencies=no
 After=systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service
 Before=cryptsetup-pre.target cryptsetup.target initrd-switch-root.target dracut-initqueue.service
+# Stop as part of the switch-root transaction. This unit is Type=oneshot with
+# RemainAfterExit=yes, so without Conflicts= it is still *active* when systemd serializes
+# its state across switch-root. The new root has no fragment for it - it only ever existed
+# inside the ramdisk - so systemd re-reads it as not-found and parks it in `systemctl
+# --failed` on every single boot, where it fails smoke-base-system.sh and buries any real
+# failure next to it. Conflicts= is the standard dracut idiom for this; dracut-initqueue.service
+# and friends all carry it.
+Conflicts=initrd-switch-root.target
 
 [Service]
 Type=oneshot

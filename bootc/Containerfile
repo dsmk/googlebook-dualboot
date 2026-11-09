@@ -55,6 +55,19 @@ RUN set -eux; \
     make -C /src/googleboot-menu; \
     cp /src/googleboot-menu/bin/googleboot-menu /out/bin/
 
+# The trees stage 2 installs from, parked in this throwaway stage so they can be bind-mounted
+# rather than COPYed into the shipped image. They go here, after the compile, so editing a
+# config does not invalidate the kernel-module build above.
+#
+# Why not bind-mount them straight from the build context: under rootless podman a context
+# bind mount loses file permissions. Directories arrive intact but every regular file in the
+# mount comes through as `-?????????` and reads fail with EACCES - verified against this
+# repo. COPY maps ownership correctly, and a COPY into a stage that is thrown away costs
+# nothing in the final image.
+COPY bootc/configs /stage/configs
+COPY bootc/files   /stage/files
+COPY --chmod=0755 bootc/install-googlebook-layer.sh /stage/install-googlebook-layer.sh
+
 ###############################################################################
 # Stage 2 - the Googlebook image
 ###############################################################################
@@ -92,9 +105,6 @@ RUN dnf -y install kexec-tools gdisk \
     && command -v kexec >/dev/null \
     && command -v sgdisk >/dev/null
 
-COPY --from=build /out/extra            /tmp/googlebook-mods/extra
-COPY --from=build /out/updates          /tmp/googlebook-mods/updates
-COPY --from=build /out/bin              /tmp/googlebook-mods/bin
 
 # The toolkit goes to /usr/local/share rather than /var/usrlocal: on fedora-bootc
 # /usr/local is a real directory inside /usr, so this is immutable, verity-backed
@@ -120,11 +130,22 @@ COPY docs            /usr/local/share/googlebook-dualboot/docs
 # Stage the trees instead; install-googlebook-layer.sh places the files with explicit modes,
 # creates only the directories that are actually missing, and asserts afterwards that every
 # directory it wrote into is still traversable.
-COPY bootc/configs/ /tmp/googlebook-stage/configs/
-COPY bootc/files/   /tmp/googlebook-stage/files/
-
-COPY --chmod=0755 bootc/install-googlebook-layer.sh /tmp/install-googlebook-layer.sh
-RUN /tmp/install-googlebook-layer.sh \
-    && rm -rf /tmp/install-googlebook-layer.sh /tmp/googlebook-mods /tmp/googlebook-stage
+#
+# Bind mounts, not COPY. These trees are build input - the layer script reads them and
+# installs their contents elsewhere - so there is no reason for them to exist in the shipped
+# image. As COPY layers they did: `COPY bootc/configs/ /tmp/googlebook-stage/configs/` and
+# friends wrote 54 files under /tmp, and the `rm -rf` in the next RUN only added whiteouts on
+# top. The files stayed in the layer history, where `ostree container image deploy` sees them
+# and refuses the image with "non-ostree compatible file paths: googlebook-stage: 41 ...".
+# A bind mount exists only for the duration of the RUN and leaves nothing behind.
+#
+# Needs podman/buildah with RUN --mount=type=bind (buildah 1.24+, podman 4.x+). If that ever
+# has to be given up, the fallback is to stage under /usr rather than /tmp - still bloat, but
+# at least on an ostree-compatible path. Both mounts come from the builder stage: see the
+# comment there for why not from the build context.
+RUN --mount=type=bind,from=build,source=/out,target=/run/gb-mods \
+    --mount=type=bind,from=build,source=/stage,target=/run/gb-stage \
+    STAGE=/run/gb-stage MODS=/run/gb-mods \
+    /run/gb-stage/install-googlebook-layer.sh
 
 RUN bootc container lint

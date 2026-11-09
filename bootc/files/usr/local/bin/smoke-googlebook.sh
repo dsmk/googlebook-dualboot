@@ -72,6 +72,29 @@ check "omit list is not shadowed by a packer-written /etc copy" \
   sh -c '! test -f /etc/dracut.conf.d/92-googlebook-bootc.conf'
 check "clevis is omitted" \
   grep -q 'clevis' /usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf
+# --- the initramfs must be able to act on ostree= ----------------------------------------
+# 50ostree's check() returns 255: available, but included only when a dracut.conf.d file
+# names it in add_dracutmodules. The base image used to do that in 20-bootc-base.conf and
+# stopped when it swapped to rpm-ostree's 20-atomic-*.conf set - after which dracut built
+# initramfses with erofs and overlay but no ostree-prepare-root.service, and Slot B
+# switch-rooted into the bare subvolume with nothing logged. install-googlebook-layer.sh
+# asserts this at build time; re-assert it here because every link but 92-googlebook-bootc.conf
+# belongs to the base image and can move under this layer between builds.
+#
+# Shadowing is already covered: the check above asserts no /etc copy of 92 exists, and 92 is
+# the file that carries the request, so a plain scan of both directories is enough here.
+check "dracut config requests the ostree module" sh -c '
+  cat /etc/dracut.conf.d/*.conf /usr/lib/dracut/dracut.conf.d/*.conf 2>/dev/null \
+    | grep -E "^[[:space:]]*add_dracutmodules" \
+    | grep -qE "[[:space:]\"]ostree[[:space:]\"]"'
+# Requested is not enough: 50ostree returns 1 - never include - unless both of these are
+# executable, which would leave the request satisfied and the initramfs still broken.
+check "50ostree dracut module present" \
+  test -d /usr/lib/dracut/modules.d/50ostree
+check "ostree-prepare-root present (50ostree check() precondition)" \
+  test -x /usr/lib/ostree/ostree-prepare-root
+check "ostree-prepare-root.service present (what gets linked into initrd-root-fs.target.wants)" \
+  test -f /usr/lib/systemd/system/ostree-prepare-root.service
 check "coreboot framebuffer autoload present" \
   test -f /usr/lib/modules-load.d/googlebook-coreboot-fb.conf
 check "staged Xe2 modprobe rules present" \

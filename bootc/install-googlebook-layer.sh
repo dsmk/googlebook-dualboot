@@ -7,7 +7,12 @@ set -euxo pipefail
 
 KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' kernel-core)"
 TOOLKIT=/usr/local/share/googlebook-dualboot
-STAGE=/tmp/googlebook-stage
+# Where the Containerfile put the trees this script installs from. Overridable because they
+# arrive as bind mounts rather than COPY layers: a COPY writes them into the image for good,
+# and a later `rm -rf` only adds a whiteout on top - the files stay in the layer history
+# either way. The defaults are the old /tmp paths so the script still runs standalone.
+STAGE="${STAGE:-/tmp/googlebook-stage}"
+MODS="${MODS:-/tmp/googlebook-mods}"
 
 # --- configs/ and files/, placed with explicit modes ----------------------------------
 # These used to arrive as `COPY --chmod=0644 bootc/configs/ /` and `--chmod=0755
@@ -55,8 +60,8 @@ chmod 0755 /etc/yum.repos.d  # stock: drwxr-xr-x
 
 # --- out-of-tree modules built in the builder stage against this exact kernel ---------
 install -d -m0755 "/usr/lib/modules/${KVER}/extra" "/usr/lib/modules/${KVER}/updates"
-install -m0644 /tmp/googlebook-mods/extra/*.ko   "/usr/lib/modules/${KVER}/extra/"
-install -m0644 /tmp/googlebook-mods/updates/*.ko "/usr/lib/modules/${KVER}/updates/"
+install -m0644 "${MODS}"/extra/*.ko   "/usr/lib/modules/${KVER}/extra/"
+install -m0644 "${MODS}"/updates/*.ko "/usr/lib/modules/${KVER}/updates/"
 
 # --- firmware the initramfs and the real root both need -------------------------------
 # intel_ish_ipc requests the ISH blob before the real root is mounted, so 91-googlebook-
@@ -82,6 +87,48 @@ for want in coreboot_table framebuffer-coreboot; do
     || { echo "FATAL: $want not resolvable for $KVER after depmod" >&2; exit 1; }
 done
 
+# --- the initramfs must be able to act on ostree= --------------------------------------
+# Slot B dies silently without this. 50ostree's check() returns 255 - "only if requested" -
+# so the module lands in the initramfs only because some dracut.conf.d file names it in
+# add_dracutmodules. That used to be the base image's 20-bootc-base.conf; a base rebuild
+# replaced it with rpm-ostree's 20-atomic-*.conf set, nothing requested ostree any more, and
+# dracut quietly built an initramfs with no ostree-prepare-root.service. There is then
+# nothing to mount /usr as a composefs and nothing to fail: systemd mounts root= from the
+# command line and switch-roots into the bare subvolume.
+#
+# 92-googlebook-bootc.conf now does the asking. Verify the whole chain here rather than
+# trusting it, because every link lives in the base image except that one file.
+#
+# /etc/dracut.conf.d is empty at build time, but check it anyway: dracut resolves conf.d by
+# basename with /etc winning over /usr/lib, so an /etc copy of 92 would shadow ours.
+dracut_conf_requests() {
+  local want=$1 f base
+  declare -A seen=()
+  for f in /etc/dracut.conf.d/*.conf /usr/lib/dracut/dracut.conf.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    base=$(basename "$f")
+    [[ -n "${seen[$base]:-}" ]] && continue   # first wins: /etc shadows /usr/lib
+    seen[$base]=$f
+  done
+  grep -hE '^[[:space:]]*add_dracutmodules\+?=' "${seen[@]}" 2>/dev/null \
+    | grep -qE "[[:space:]\"]${want}[[:space:]\"]"
+}
+dracut_conf_requests ostree \
+  || { echo "FATAL: no dracut.conf.d file requests the 'ostree' module;" >&2
+       echo "       Slot B would switch-root into the bare subvolume" >&2; exit 1; }
+
+# And the module has to be installable once requested. 50ostree returns 1 - never include,
+# even when asked - unless both of these are executable, so a base image that drops either
+# would leave the request above satisfied and the initramfs still broken.
+[[ -d /usr/lib/dracut/modules.d/50ostree ]] \
+  || { echo "FATAL: dracut module 50ostree missing from the base image" >&2; exit 1; }
+[[ -x /usr/lib/ostree/ostree-prepare-root ]] \
+  || { echo "FATAL: /usr/lib/ostree/ostree-prepare-root missing; 50ostree check() returns 1" >&2; exit 1; }
+[[ -x /usr/lib/systemd/systemd ]] \
+  || { echo "FATAL: /usr/lib/systemd/systemd missing; 50ostree check() returns 1" >&2; exit 1; }
+[[ -f /usr/lib/systemd/system/ostree-prepare-root.service ]] \
+  || { echo "FATAL: ostree-prepare-root.service missing; nothing to link into initrd-root-fs.target.wants" >&2; exit 1; }
+
 # --- ALSA UCM: anchor the SpeakerCodec1 regex so rt721 does not also match rt7210 etc. --
 if [[ -f /usr/share/alsa/ucm2/sof-soundwire/rt721.conf ]]; then
   sed -i 's/Regex "(rt721(-sdca)?)"/Regex "^(rt721(-sdca)?)$"/' \
@@ -91,7 +138,7 @@ fi
 # --- googleboot-menu binary from the builder stage ------------------------------------
 # install-into-initramfs.sh tries `make -B` first and falls back to this prebuilt binary,
 # which is the path taken here because the runtime image has no compiler.
-install -D -m0755 /tmp/googlebook-mods/bin/googleboot-menu \
+install -D -m0755 "${MODS}/bin/googleboot-menu" \
   "${TOOLKIT}/googleboot-menu/bin/googleboot-menu"
 
 # --- command-line entry points --------------------------------------------------------
