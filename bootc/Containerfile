@@ -6,7 +6,9 @@
 #   podman build -f bootc/Containerfile -t ghcr.io/dsmk/bootc-image-googlebook:main .
 #
 # See docs/BOOTC_GOOGLEBOOK.md for how to deploy the result onto Slot B.
+#ARG BASE_IMAGE=ghcr.io/dsmk/bootc-image-laptop:main
 ARG BASE_IMAGE=ghcr.io/dsmk/bootc-image-laptop:main
+
 
 ###############################################################################
 # Stage 1 - compile against the base image's own kernel
