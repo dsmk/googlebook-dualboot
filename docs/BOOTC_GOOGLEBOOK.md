@@ -587,12 +587,25 @@ deployment deliberately — after an upgrade there are two, and `ls … | head -
 to pick the rollback as the one that boots:
 
 ```bash
-SYSROOT=/mnt/sysroot                 # wherever the btrfs subvol is mounted
-ENTRY=$(grep -l '^options .*ostree=' "$SYSROOT"/boot/loader/entries/*.conf | head -1)
+SYSROOT=/mnt/sysroot                 # wherever the btrfs subvol is mounted; /boot must be mounted under it
+# The deployment that boots next is index 0: libostree ends its title with ":0)" and gives it
+# the highest "version". Same rule googlebook-pack-slotb packs by (bls_default_entry), so
+# picking any other entry leaves Slot B packed for a deployment ostree does not boot.
+ENTRY=$(grep -l ':0)[[:space:]]*$' "$SYSROOT"/boot/loader/entries/*.conf | head -1)
+[ -n "$ENTRY" ] || ENTRY=$(grep -H '^version ' "$SYSROOT"/boot/loader/entries/*.conf \
+                           | sort -t' ' -k2 -n | tail -1 | cut -d: -f1)
 OSTREE_ARG=$(sed -n 's/^options .*ostree=\([^ ]*\).*/\1/p' "$ENTRY" | head -1)
 DEPLOY=$(readlink -f "$SYSROOT$OSTREE_ARG")   # the deployment that entry actually boots
-echo "$DEPLOY"
+STATEROOT=$(dirname "$(dirname "$DEPLOY")")
+echo "$ENTRY -> $DEPLOY"
 ```
+
+Resolve it this way rather than matching the hash from a boot message against
+`/ostree/deploy/*/deploy/*.0`: those are ostree *commit* checksums, while the hash in an
+`ostree=` argument or an `ostree-prepare-root` error is a **bootcsum** — a hash of the
+kernel and initramfs pair, which names the directories under `/boot/ostree` and
+`/ostree/boot.<n>/<stateroot>`. Deployments sharing a kernel share one bootcsum, and the two
+hashes never match each other.
 
 Then bind-mount and chroot as in section 3 and run `googlebook-pack-slotb`. The full
 sequence, for a machine that cannot boot Linux at all:
