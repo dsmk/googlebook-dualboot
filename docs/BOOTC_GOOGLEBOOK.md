@@ -594,7 +594,93 @@ DEPLOY=$(readlink -f "$SYSROOT$OSTREE_ARG")   # the deployment that entry actual
 echo "$DEPLOY"
 ```
 
-Then bind-mount and chroot as in section 3 and run `googlebook-pack-slotb`.
+Then bind-mount and chroot as in section 3 and run `googlebook-pack-slotb`. The full
+sequence, for a machine that cannot boot Linux at all:
+
+**1. Get into Android.** Slot A is untouched by any of this. Pick **Googlebook OS** in the
+menu, or from the Fastboot screen (hold Volume Down at power-on), from your computer:
+
+```bash
+fastboot --set-active=a && fastboot reboot
+```
+
+**2. Put the Slot B installer back**, with the USB-C Ethernet adapter connected. This
+overwrites the Linux boot images, which is fine — step 7 writes them again:
+
+```bash
+./scripts/flash-slotb.sh ./slotb-installer --adb
+```
+
+**3. Boot Slot B and ssh in.** `build-slotb-installer.sh` puts `inst.text inst.sshd` on the
+command line for every Stage2 installer, so sshd is already running; the installer's text UI
+shows the DHCP address.
+
+**4. Fetch the toolkit onto the installer.** Straight from GitHub, which needs the
+repository to be public and the installer to have network — both true on the machine this
+was written from:
+
+```bash
+BRANCH=main   # or a branch carrying a fix that has not merged yet; a slash in the name is fine
+```
+
+```bash
+curl -L -o /tmp/gbdb.tar.gz "https://github.com/dsmk/googlebook-dualboot/archive/refs/heads/$BRANCH.tar.gz"
+```
+
+```bash
+mkdir -p /tmp/gbdb && tar -xzf /tmp/gbdb.tar.gz -C /tmp/gbdb --strip-components=1
+```
+
+Otherwise push a checkout from your computer with `scp -r ./googlebook-dualboot
+root@<LAPTOP_IP>:/tmp/gbdb`, or serve a tarball from the same `python3 -m http.server` that
+hosts the extracted ISO.
+
+**5. Mount the root and resolve the deployment** with the snippet above, then bind-mount as
+in section 3 and copy the checkout in where the chroot can reach it:
+
+```bash
+mkdir -p "$DEPLOY/tmp/gbdb" && cp -a /tmp/gbdb/. "$DEPLOY/tmp/gbdb/"
+```
+
+**6. Copy the compiled menu binary from the image into the checkout.** This step is not
+optional and the failure is obscure without it: `googleboot-menu/bin/googleboot-menu` is a
+build artifact excluded by `.gitignore`, so a clone or a source tarball has only
+`googleboot-scan`. `install-into-initramfs.sh` opens with `make -B … || [[ -x
+bin/googleboot-menu ]]`, the `make` fails because an image-based deployment ships no
+compiler, the fallback test then fails too, and the packer calls that installer unguarded
+under `set -euo pipefail` — so the whole pack exits before writing anything. The image's own
+binary was compiled in the Containerfile's builder stage against this exact kernel and
+glibc:
+
+```bash
+cp "$DEPLOY/usr/local/share/googlebook-dualboot/googleboot-menu/bin/googleboot-menu" "$DEPLOY/tmp/gbdb/googleboot-menu/bin/googleboot-menu"
+```
+
+```bash
+chmod 755 "$DEPLOY/tmp/gbdb/googleboot-menu/bin/googleboot-menu"
+```
+
+**7. Pack from the checkout, not from `/usr/local/bin`.** The packer takes `googleboot-scan`
+and the module sources from its own `SELF_DIR`, so running the checkout's copy puts the
+checkout's boot menu into the Slot B initramfs even though the deployed image still carries
+an older one:
+
+```bash
+chroot "$DEPLOY" env TMPDIR=/tmp /tmp/gbdb/bin/googlebook-pack-slotb
+```
+
+**8. Check the packed command line against the entry before rebooting.** The packer prints
+`cmdline:`; its `ostree=` has to match this exactly, `boot.<n>` included:
+
+```bash
+chroot "$DEPLOY" grep -h '^options' /boot/loader/entries/*.conf | tr ' ' '\n' | grep '^ostree='
+```
+
+**9. Rebuild the image to make it stick.** A recovery pack from a checkout fixes the
+initramfs on the device, but `googlebook-slotb-sync` runs `/usr/local/bin/googlebook-pack-slotb`,
+whose `SELF_DIR` is the deployed image's toolkit — so the next automatic repack reinstalls
+the image's older `googleboot-scan`. The checkout only holds until the next upgrade triggers
+one.
 
 **Slot B boots, but into the pre-migration OS instead of the bootc deployment.** This one
 has no error message anywhere, which is what makes it confusing. `bootc install
