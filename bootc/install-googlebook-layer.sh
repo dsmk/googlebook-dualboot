@@ -48,6 +48,12 @@ ls -d /usr/lib/dracut/modules.d/*ostree >/dev/null 2>&1 \
   || { echo "FATAL: no ostree dracut module in this image; Slot B would boot the wrong userspace" >&2; exit 1; }
 test -x /usr/lib/ostree/ostree-prepare-root \
   || { echo "FATAL: /usr/lib/ostree/ostree-prepare-root missing; nothing would mount /usr" >&2; exit 1; }
+# The binary alone is not enough: what the dracut module links into
+# initrd-root-fs.target.wants is this unit, and the unit is what makes systemd run the
+# binary. A package that ever ships one without the other passes every other check here and
+# fails on the device, after a five-minute pack, at the packer's composefs assertion.
+test -f /usr/lib/systemd/system/ostree-prepare-root.service \
+  || { echo "FATAL: ostree-prepare-root.service missing; the dracut module would have no unit to link" >&2; exit 1; }
 grep -q 'force_add_dracutmodules.*ostree' /usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf \
   || { echo "FATAL: 92-googlebook-bootc.conf no longer forces the ostree dracut module" >&2; exit 1; }
 
@@ -75,6 +81,12 @@ ln -sf /usr/local/bin/googlebook-switch-slot /usr/local/bin/boot-android
 # COPY keeps the source modes, so the toolkit's own scripts are already 0755; this only
 # makes sure nothing in the tree is unreadable to a non-root user.
 chmod -R a+rX "${TOOLKIT}"
+# Assert it took. A COPY that lands 0700 directories, or a dropped chmod, makes the whole
+# toolkit root-only - and the one thing that reads it as a normal user is the docs tree the
+# slotb-sync unit points its Documentation= at, so the failure is silent.
+unreadable=$(find "${TOOLKIT}" \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print -quit)
+[[ -z "$unreadable" ]] \
+  || { echo "FATAL: ${unreadable} is not readable by a non-root user after chmod -R a+rX" >&2; exit 1; }
 
 # --- hwdb: fold the Moonstone Vivaldi keymap into the image's binary index -------------
 # udev looks for /etc/udev/hwdb.bin before /usr/lib/udev/hwdb.bin, and the base image

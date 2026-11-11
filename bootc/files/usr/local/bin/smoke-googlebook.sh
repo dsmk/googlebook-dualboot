@@ -82,6 +82,15 @@ check "ostree-prepare-root present" \
   test -x /usr/lib/ostree/ostree-prepare-root
 check "ostree dracut module forced past hostonly probing" \
   grep -qE 'force_add_dracutmodules.*ostree' /usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf
+# The binary is only half of it - this unit is what the dracut module links into
+# initrd-root-fs.target.wants, and it is checkable here, in a container, where the packed
+# initramfs listing checked further down is not.
+check "ostree-prepare-root.service present (what gets linked into initrd-root-fs.target.wants)" \
+  test -f /usr/lib/systemd/system/ostree-prepare-root.service
+# install-googlebook-layer.sh runs chmod -R a+rX over the toolkit; a COPY that lands 0700
+# directories would otherwise make it root-only without anything saying so.
+check "shipped directories traversable by non-root" \
+  sh -c 'test -z "$(find /usr/local/share/googlebook-dualboot \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print -quit)"'
 check "coreboot framebuffer autoload present" \
   test -f /usr/lib/modules-load.d/googlebook-coreboot-fb.conf
 check "staged Xe2 modprobe rules present" \
