@@ -546,8 +546,8 @@ fastboot --set-active=a && fastboot reboot   # Googlebook OS / Android 17 (Slot 
 
 ### What *is* different: Slot B has to follow image upgrades
 
-On a package-based install, `/etc/kernel/install.d/95-googlebook-slotb.install` re-packs
-Slot B whenever a kernel RPM lands. A bootc system never installs a kernel that way —
+On a package-based install, `/etc/kernel/install.d/40-` and `95-googlebook-slotb.install`
+prepare the modules and then re-pack Slot B whenever a kernel RPM lands. A bootc system never installs a kernel that way —
 `bootc upgrade` swaps the whole `/usr` tree and writes a new BLS entry — so the trigger is
 that entry changing instead:
 
@@ -557,7 +557,7 @@ that entry changing instead:
 | `googlebook-slotb-sync.service` | Re-packs Slot B when the fingerprint of those entries changes |
 
 `googlebook-pack-slotb` writes no kernel hooks at all on an ostree deployment — neither
-`/etc/kernel/install.d/95-googlebook-slotb.install` nor the Debian `postinst.d` one, since
+the `/etc/kernel/install.d/` pair nor the Debian `postinst.d` one, since
 no kernel ever arrives through a package transaction here. Writing them would only leave
 files in the deployment's `/etc` for ostree to carry through every future 3-way merge, for
 a code path that cannot run. The `.path` unit above is the whole mechanism.
