@@ -514,10 +514,19 @@ boot_entry() {
           kcmdline=$(merge_hw_args "$fcmdline")
           echo "[googleboot-scan] kexec loading $fkernel (initrd=$finitrd)..."
           [[ "$kcmdline" != "$fcmdline" ]] && echo "[googleboot-scan]   cmdline: $kcmdline"
+          local kexec_rc=0
           if [[ -n "$finitrd" && -f "$finitrd" ]]; then
-            kexec -l "$fkernel" --initrd="$finitrd" --command-line="$kcmdline"
+            kexec -l "$fkernel" --initrd="$finitrd" --command-line="$kcmdline" || kexec_rc=$?
           else
-            kexec -l "$fkernel" --command-line="$kcmdline"
+            kexec -l "$fkernel" --command-line="$kcmdline" || kexec_rc=$?
+          fi
+          # Check the load rather than assume it. kexec -l's status was ignored here, so a
+          # refused load still announced a handoff. /sys/kernel/kexec_loaded is the kernel's
+          # own answer, not the tool's, and costs nothing to read.
+          if (( kexec_rc != 0 )) || [[ "$(cat /sys/kernel/kexec_loaded 2>/dev/null || echo 0)" != 1 ]]; then
+            echo "[googleboot-scan] kexec -l failed (exit $kexec_rc) - no image is loaded." >&2
+            echo "[googleboot-scan]   Not handing off. Repack Slot B to fix the command line." >&2
+            exit 1
           fi
           if [[ "$target_id" != usb:* ]]; then
             umount "$BOOT_MNT" 2>/dev/null || true
@@ -530,7 +539,17 @@ boot_entry() {
           # after this line, control was handed over and the new kernel is the one that is
           # silent; if it stops before, the handoff itself is where it hung.
           echo "[googleboot-scan] handing off to the new kernel..."
-          systemctl kexec 2>/dev/null || kexec -e
+          # systemctl kexec goes first because it shuts the initramfs down cleanly, but it
+          # returns 0 as soon as PID 1 accepts the job - it does NOT block until control
+          # transfers. `systemctl kexec || kexec -e` therefore skipped the fallback in
+          # exactly the case that needed it: observed on Moonstone as both commands silent,
+          # this script carrying on, and the boot continuing into a stale ostree= path that
+          # ends in emergency mode with a locked root account. So let systemd try, give it a
+          # moment, then force it - kexec -e does not return on success, so anything after
+          # this line means the handoff genuinely did not happen.
+          systemctl kexec 2>/dev/null || true
+          sleep 3 2>/dev/null || true
+          kexec -e || true
           echo "[googleboot-scan] kexec did not take control; still in the Slot B initramfs" >&2
           exit 0
         fi
