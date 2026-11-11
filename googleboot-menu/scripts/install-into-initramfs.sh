@@ -54,7 +54,17 @@ cat > "$RD_DIR/etc/systemd/system/googleboot-menu.service" << 'EOF'
 Description=GoogleBook Moonstone Graphical kexec Boot Menu
 DefaultDependencies=no
 After=systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service
-Before=cryptsetup-pre.target cryptsetup.target initrd-switch-root.target dracut-initqueue.service
+# The last three are what actually gate this boot, and leaving them out cost the menu its
+# countdown. With root=UUID= on the command line and the NVMe driver already in
+# rd.driver.pre, systemd-fstab-generator mounts sysroot itself and dracut-initqueue never
+# runs at all - so ordering before initqueue gated nothing. sysroot then mounted about a
+# second in, initrd-root-fs.target was reached, and initrd-cleanup.service isolated
+# initrd-switch-root.target, which STOPS every unit not part of that target regardless of
+# ordering: the menu died on SIGTERM at 1.07s with its 5-second timer still running, and the
+# selector flashed up unreadably. Before=initrd-switch-root.target does not help, because an
+# isolate is not an ordering question. Measured on Moonstone; it only looked fine while a
+# stale ostree= kept sysroot from mounting at all, which let the menu outlive the boot.
+Before=cryptsetup-pre.target cryptsetup.target initrd-switch-root.target dracut-initqueue.service initrd-cleanup.service sysroot.mount initrd-root-fs.target
 
 [Service]
 Type=oneshot

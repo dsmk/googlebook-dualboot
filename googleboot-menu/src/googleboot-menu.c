@@ -187,7 +187,7 @@ static void init_default_theme(theme_config_t *t) {
     t->card_height = 560;
     t->card_radius = 28;
     t->card_gap    = 44;
-    t->timeout_sec = 3;
+    t->timeout_sec = 5;
 }
 
 static void trim_str(char *s) {
