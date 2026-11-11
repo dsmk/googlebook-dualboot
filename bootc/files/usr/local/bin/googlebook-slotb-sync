@@ -33,9 +33,26 @@ fingerprint() {
   } | sha256sum | awk '{print $1}'
 }
 
+# A staged deployment is finalized at shutdown, and that write is what flips
+# /ostree/boot.0 <-> boot.1 and rewrites every entry. Packing before it happens bakes a path
+# that stops existing the moment the machine goes down: the next boot finds Slot B stale and
+# has to kexec, and kexec from this initramfs has never once worked on this hardware -
+# systemctl kexec returned 0 without transferring control on one boot and blocked forever on
+# the next. Finalizing here, while the system is up, makes the entries this pack reads the
+# ones the next boot will actually use, so the boot is direct and no fallback is needed.
+#
+# This runs the same ExecStop= systemd would run at shutdown, so it is a change of timing
+# and not of outcome: the staged deployment was going to become the next boot either way.
+if [[ -f /run/ostree/staged-deployment ]]; then
+  log "finalizing the staged deployment first - this flips the boot version now, not at shutdown"
+  systemctl stop ostree-finalize-staged.service \
+    || log "WARNING: finalize failed; Slot B may be packed for a path the shutdown flip invalidates"
+fi
+
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
+# After the finalize above, not before: it rewrites the very entries this hashes.
 CUR=$(fingerprint)
 if [[ -z "$CUR" || "$CUR" == "$(printf '' | sha256sum | awk '{print $1}')" ]]; then
   log "no ostree boot entries under /boot; nothing to pack"

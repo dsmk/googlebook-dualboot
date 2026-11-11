@@ -426,6 +426,42 @@ merge_hw_args() {
 # Extract the ostree= argument from a command line string. Pure bash on purpose: this runs in
 # the Slot B initramfs, where sed and awk are only present if some dracut module happened to
 # pull them in.
+# Read one argument out of a kernel command line string. Pure bash, same reason as below.
+cmdline_arg() {
+  local key="$1" line="$2" a
+  for a in $line; do
+    case "$a" in "$key"=*) printf '%s' "${a#*=}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# Does a packed ostree= path still exist on the root filesystem?
+#
+# When ostree flips its boot version it writes the new /ostree/boot.<n> tree and removes the
+# old one, so a packed path differing from the entry only in that number names the same
+# deployment but may or may not still resolve. If it does, a direct boot is correct and the
+# kexec fallback - which on this hardware has never once worked - is not needed at all.
+# Checking costs one read-only mount. root= and rootflags= come from the packed command
+# line, which is the one this kernel booted with, so they are the right ones by construction.
+packed_path_resolves() {
+  local path="$1" cl root rootflags dev mnt=/run/googleboot/rootcheck rc=1
+  cl=$(cat /proc/cmdline 2>/dev/null) || return 1
+  root=$(cmdline_arg root "$cl") || return 1
+  rootflags=$(cmdline_arg rootflags "$cl" || true)
+  case "$root" in
+    UUID=*) dev="/dev/disk/by-uuid/${root#UUID=}" ;;
+    /dev/*) dev="$root" ;;
+    *)      return 1 ;;
+  esac
+  [[ -e "$dev" ]] || return 1
+  mkdir -p "$mnt" 2>/dev/null || true
+  if mount -o "ro${rootflags:+,$rootflags}" "$dev" "$mnt" 2>/dev/null; then
+    [[ -e "$mnt$path" ]] && rc=0
+    umount "$mnt" 2>/dev/null || true
+  fi
+  return $rc
+}
+
 ostree_arg() {
   local a
   for a in $1; do
@@ -497,10 +533,32 @@ boot_entry() {
           entry_ostree=$(ostree_arg "$fcmdline" || true)
           if [[ -n "$entry_ostree" && -n "$running_ostree" && "$running_ostree" != "$entry_ostree" ]]; then
             ostree_fresh=0
-            echo "[googleboot-scan] Slot B command line is stale; re-booting via the current boot entry."
-            echo "[googleboot-scan]   packed: ostree=$running_ostree"
-            echo "[googleboot-scan]   entry:  ostree=$entry_ostree"
-            echo "[googleboot-scan]   run googlebook-pack-slotb to make this direct again."
+            # Two very different situations produce two different strings here, and treating
+            # them alike is what sent this machine to the kexec path twice for no reason.
+            # /ostree/boot.<n>/<stateroot>/<bootcsum>/<index>: only <n> changes when ostree
+            # flips its boot version at finalize time, and the deployment is then identical -
+            # same kernel, same commit, same everything. A direct boot is correct in that
+            # case, provided the packed path still exists, which it does not always: ostree
+            # removes the tree for the version it flipped away from. So check instead of
+            # guessing either way.
+            local packed_dep="${running_ostree#/ostree/boot.*/}" entry_dep="${entry_ostree#/ostree/boot.*/}"
+            if [[ "$packed_dep" == "$entry_dep" && "$packed_dep" != "$running_ostree" ]]; then
+              if packed_path_resolves "$running_ostree"; then
+                ostree_fresh=1
+                echo "[googleboot-scan] Slot B's ostree= names this same deployment at the other boot"
+                echo "[googleboot-scan]   version, and that path still resolves - booting direct."
+                echo "[googleboot-scan]   packed: ostree=$running_ostree"
+              else
+                echo "[googleboot-scan] Slot B's ostree= names this same deployment, but at a boot"
+                echo "[googleboot-scan]   version ostree has since removed."
+              fi
+            fi
+            if (( ! ostree_fresh )); then
+              echo "[googleboot-scan] Slot B command line is stale; re-booting via the current boot entry."
+              echo "[googleboot-scan]   packed: ostree=$running_ostree"
+              echo "[googleboot-scan]   entry:  ostree=$entry_ostree"
+              echo "[googleboot-scan]   run googlebook-pack-slotb to make this direct again."
+            fi
           fi
           if [[ -f /etc/initrd-release && ( "$fkernel" == "SlotB-Direct" || "$fkernel" == */vmlinuz-linux || ( -n "$running_kver" && "$fkernel" == *"$running_kver"* ) ) && "$target_id" != usb:* ]] \
              && (( ostree_fresh )); then
@@ -539,17 +597,27 @@ boot_entry() {
           # after this line, control was handed over and the new kernel is the one that is
           # silent; if it stops before, the handoff itself is where it hung.
           echo "[googleboot-scan] handing off to the new kernel..."
-          # systemctl kexec goes first because it shuts the initramfs down cleanly, but it
-          # returns 0 as soon as PID 1 accepts the job - it does NOT block until control
-          # transfers. `systemctl kexec || kexec -e` therefore skipped the fallback in
-          # exactly the case that needed it: observed on Moonstone as both commands silent,
-          # this script carrying on, and the boot continuing into a stale ostree= path that
-          # ends in emergency mode with a locked root account. So let systemd try, give it a
-          # moment, then force it - kexec -e does not return on success, so anything after
-          # this line means the handoff genuinely did not happen.
-          systemctl kexec 2>/dev/null || true
-          sleep 3 2>/dev/null || true
+          # kexec -e goes first, deliberately. systemctl kexec is the tidier call - it
+          # shuts the initramfs down cleanly - but it has failed here twice, in two
+          # different ways, and neither failure let kexec -e run at all:
+          #   1. it returned 0 without transferring control, so `systemctl kexec || kexec -e`
+          #      skipped the fallback and the boot carried on into a stale ostree= path;
+          #   2. it blocked and never returned, so nothing after it ran either.
+          # Both measured on Moonstone, on consecutive nights. There is nothing left to shut
+          # down cleanly by this point regardless - /sysroot and the boot partition are
+          # unmounted and synced a few lines above - so make the call that either works or
+          # returns, and keep systemd as the thing that gets one bounded try afterwards.
           kexec -e || true
+          echo "[googleboot-scan] kexec -e did not take; trying systemd..." >&2
+          # Bounded, because an unbounded systemctl kexec is exactly what left the console
+          # frozen on "handing off to the new kernel..." with no way forward. timeout is
+          # coreutils and may not be here; without it, accept the risk rather than skip the
+          # attempt.
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 15 systemctl kexec 2>/dev/null || true
+          else
+            systemctl kexec 2>/dev/null || true
+          fi
           echo "[googleboot-scan] kexec did not take control; still in the Slot B initramfs" >&2
           exit 0
         fi

@@ -796,12 +796,42 @@ the `ostree=` it booted with against the one in the selected boot entry, and fal
 survives an un-repacked upgrade with one extra kexec and a message saying so. Repack to make
 it direct again.
 
-**Expect this on the first boot after every upgrade.** `bootc upgrade` only *stages* a
-deployment; `ostree-finalize-staged.service` writes the bootloader config at **shutdown**,
-and that write is what flips `boot.0` ↔ `boot.1`. Any repack necessarily ran before the
-flip, so the first boot afterwards always takes the kexec fallback, and the repack that
-makes the next one direct happens on that boot. A packed path differing from the entry only
-in `boot.<n>` — same bootcsum, same index — is this, not a wrong deployment.
+**This is what an un-finalized upgrade looks like, and it is avoidable.** `bootc upgrade`
+only *stages* a deployment; `ostree-finalize-staged.service` writes the bootloader config at
+**shutdown**, and that write is what flips `boot.0` ↔ `boot.1` and rewrites every entry. A
+repack that runs before the flip therefore bakes a path that stops existing the moment the
+machine goes down, and the next boot finds Slot B stale. A packed path differing from the
+entry only in `boot.<n>` — same stateroot, same bootcsum, same index — is always this, never
+a wrong deployment.
+
+Do not rely on the kexec fallback to carry you through it. On this hardware that path has
+never once worked: `systemctl kexec` returned 0 without transferring control on one boot,
+leaving `systemctl kexec || kexec -e` to skip the fallback entirely, and blocked forever on
+the next, freezing the console at `handing off to the new kernel...`. Both ended in a hard
+power-off.
+
+**Finalize before you repack instead.** This runs the same `ExecStop=` systemd would run at
+shutdown, so it changes the timing and not the outcome — the staged deployment was going to
+become the next boot either way — but it means the entries the pack reads are the ones the
+next boot will use, and that boot is direct:
+
+```bash
+sudo bootc upgrade
+sudo systemctl stop ostree-finalize-staged.service   # performs the flip now
+sudo googlebook-slotb-sync --force
+sudo reboot
+```
+
+`googlebook-slotb-sync` does this itself when `/run/ostree/staged-deployment` exists, so the
+automatic repack from the `.path` unit gets it right too; the sequence above is only needed
+when driving a pack by hand. `googleboot-scan` also no longer treats every difference
+alike: when the packed and entry paths differ *only* in `/ostree/boot.<n>` they name the
+same deployment, so it mounts the root read-only, checks whether the packed path still
+resolves, and boots direct when it does — which is correct, and skips the kexec entirely.
+ostree removes the tree for the version it flipped away from, so that check often says no;
+when it does, the fallback runs as before and the console says which of the two it was. The one case it cannot help is a pack run from an installer
+chroot, where there is no systemd to stop the unit — finalize from the booted system before
+you reboot into trouble, not after.
 
 **The fallback used to hang here, with the menu's last line frozen on screen.** It kexec'd
 with the BLS entry's command line verbatim, and an ostree entry carries `root=`, `ostree=`,
