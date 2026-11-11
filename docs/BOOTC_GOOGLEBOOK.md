@@ -483,9 +483,28 @@ only differences are where the tools live and the one extra step after an upgrad
 
 ### From the graphical `googleboot-menu` bootloader
 
-Unchanged. At every Slot B boot, `googleboot-menu` renders the `2880x1800` selector where
-you choose **Fedora / Linux** (with LUKS2 unlock) or **Googlebook OS** (a one-shot reboot
-into Slot A that keeps Slot B as the default next boot).
+At every Slot B boot, `googleboot-menu` renders the `2880x1800` selector where you choose
+**Fedora / Linux** (with LUKS2 unlock) or **Googlebook OS** (a one-shot reboot into Slot A
+that keeps Slot B as the default next boot).
+
+On a bootc system the other deployments appear too, under **Advanced options**, each as a
+kexec card — which is rollback from the boot menu, with no external computer. Two details
+of that are ostree-specific:
+
+- **The main card is the deployment that boots next**, picked the way
+  `googlebook-pack-slotb` picks it (`bls_default_entry`): the entry whose title ends in
+  `:0)`, else the highest `version`. ostree entry filenames carry no kernel version, so the
+  scanner's filename heuristic cannot find it, and plain glob order picks the wrong entry
+  once there are ten deployments — `ostree-10.conf` sorts before `ostree-2.conf`. The main
+  card must agree with what Slot B was packed for, or it offers to direct-boot a kernel
+  whose `ostree=` is not the one in `vendor_cmdline`.
+- **The card subtitle shows the kernel version, taken from the `vmlinuz-<kver>` basename.**
+  The BLS `version` field is not a kernel version on an ostree system; libostree writes
+  `n_deployments - index` there, so reading it would label every card `KERNEL 2`.
+
+Selecting the main card still direct-boots when Slot B's packed `ostree=` matches the
+entry, and falls back to one kexec with a message when it does not — the un-repacked
+upgrade case described below.
 
 The menu binary is part of the image at
 `/usr/local/share/googlebook-dualboot/googleboot-menu/bin/googleboot-menu`, symlinked to
@@ -536,6 +555,12 @@ that entry changing instead:
 |---|---|
 | `googlebook-slotb-sync.path` | Watches `/boot/loader.0/entries` and `/boot/loader.1/entries` |
 | `googlebook-slotb-sync.service` | Re-packs Slot B when the fingerprint of those entries changes |
+
+`googlebook-pack-slotb` writes no kernel hooks at all on an ostree deployment — neither
+`/etc/kernel/install.d/95-googlebook-slotb.install` nor the Debian `postinst.d` one, since
+no kernel ever arrives through a package transaction here. Writing them would only leave
+files in the deployment's `/etc` for ostree to carry through every future 3-way merge, for
+a code path that cannot run. The `.path` unit above is the whole mechanism.
 
 Both are enabled in the image. The `.path` unit deliberately watches the two real
 directories rather than `/boot/loader/entries`: ostree flips the `/boot/loader` symlink
@@ -617,6 +642,7 @@ OTA from Slot B to Slot A and puts Linux back in Slot B.
 | `/etc/keyd/cros.conf` | Vivaldi top-row remap, for a `keyd` installed from COPR; Fedora 44 does not package it, so on Fedora the top row is handled by the hwdb entry above plus the `EVIOCSKEYCODE` pass in `googlebook-gpu-init` |
 | `/usr/local/share/googlebook-dualboot/` | The whole toolkit, including module sources and `googleboot-menu` |
 | `/usr/local/bin/` | Symlinks for `googlebook-pack-slotb`, `-restore-slotb`, `-switch-slot`, `-sysroot-sync`, `googleboot-menu`, `googleboot-scan`, `boot-android` |
+| `/usr/lib/googlebook/sysroot-sync.d/` | Optional add-on steps for `googlebook-sysroot-sync`; the packer copies this and `/etc/googlebook/sysroot-sync.d` into the Slot B initramfs, `/etc` last so a local step overrides an image one of the same name. Steps run with `SYSROOT_USR_RW` and `SYSROOT_OSTREE` exported, so a step can skip a write to the read-only `/sysroot/usr` instead of failing it |
 
 The toolkit lives in `/usr/local/share` rather than `/var/usrlocal` because on
 `fedora-bootc` `/usr/local` is a real directory inside `/usr` — immutable, verity-backed
@@ -675,6 +701,24 @@ This failure mode is why the packer asserts the symlink rather than just the mod
 the unit there is nothing to fail: systemd mounts `root=` from the command line and
 switch-roots into the bare subvolume, booting the wrong userspace or none, with nothing
 logged anywhere.
+
+**A blunter version of the same failure: the image has no `ostree` package at all.** `bootc`
+links against `libostree`, so a trimmed base carrying only `ostree-libs` satisfies it — the
+image builds, `bootc container lint` passes, the install deploys, `/ostree/deploy` and
+`ostree=` boot entries all appear, and `/usr/lib/ostree` does not exist. Seen on this machine
+as `package ostree is not installed` inside a deployment that looked entirely healthy. Check a
+base before building on it:
+
+```bash
+podman run --rm ghcr.io/dsmk/bootc-image-laptop:main \
+  sh -c 'rpm -q ostree; ls -d /usr/lib/dracut/modules.d/*ostree'
+```
+
+[`bootc/Containerfile`](../bootc/Containerfile) now installs `ostree` itself rather than
+trusting the base for it, and `googlebook-pack-slotb` passes `--force-add ostree` so a pack
+does not depend on the deployment's own `dracut.conf.d` doing the asking. Note what the
+symptom is *not*: `erofs` and `overlay` are reported present and probe-installable
+throughout, because they arrive through `instmods` and never needed the module.
 
 **`googleboot-menu.service` listed as `not-found failed` in `systemctl --failed`.** Cosmetic,
 and fixed in images built after 2026-11-09. The unit only ever exists inside the ramdisk; it
@@ -752,19 +796,144 @@ the `ostree=` it booted with against the one in the selected boot entry, and fal
 survives an un-repacked upgrade with one extra kexec and a message saying so. Repack to make
 it direct again.
 
+**Expect this on the first boot after every upgrade.** `bootc upgrade` only *stages* a
+deployment; `ostree-finalize-staged.service` writes the bootloader config at **shutdown**,
+and that write is what flips `boot.0` ↔ `boot.1`. Any repack necessarily ran before the
+flip, so the first boot afterwards always takes the kexec fallback, and the repack that
+makes the next one direct happens on that boot. A packed path differing from the entry only
+in `boot.<n>` — same bootcsum, same index — is this, not a wrong deployment.
+
+**The fallback used to hang here, with the menu's last line frozen on screen.** It kexec'd
+with the BLS entry's command line verbatim, and an ostree entry carries `root=`, `ostree=`,
+`rootflags=` and `quiet rhgb` — none of the arguments this hardware needs. The kernel came
+up with no `rd.driver.pre` for the Coreboot framebuffer modules, so `simpledrm` never bound
+and there was no display; no `console=tty0`, so no text either; and no `clk_ignore_unused`.
+Nothing is logged because nothing reaches a console, and the only way out is the power
+button. `googleboot-scan` now merges `rw console=tty0`, the `rd.driver.pre` pair and
+`clk_ignore_unused` into every command line it kexecs from a BLS entry, adding only what is
+absent so an entry keeping its own `ro`, `console=` or `rd.driver.pre=` is respected, and
+drops `quiet rhgb` so a failure on this path is visible. The same merge covers the
+**Advanced options** cards, which kexec older entries by the same route.
+
+A related trap on the same path: `googleboot-scan` calls `sync` before handing over, and
+`sync` is coreutils and is not in the Slot B initramfs unless asked for — it showed up as
+`line 452: sync: command not found`. The script runs under `set -uo pipefail` with no `-e`,
+so this never aborted anything, but it did skip the flush after `googlebook-sysroot-sync`
+had just written into `/sysroot`. `install_optional_items+=" /usr/bin/sync "` in
+`90-googlebook-slotb.conf` puts it in the image, and the calls are guarded either way.
+
 **To recover a machine already in this state**, boot installation media and repack. Pick the
 deployment deliberately — after an upgrade there are two, and `ls … | head -1` is as likely
 to pick the rollback as the one that boots:
 
 ```bash
-SYSROOT=/mnt/sysroot                 # wherever the btrfs subvol is mounted
-ENTRY=$(grep -l '^options .*ostree=' "$SYSROOT"/boot/loader/entries/*.conf | head -1)
+SYSROOT=/mnt/sysroot                 # wherever the btrfs subvol is mounted; /boot must be mounted under it
+# The deployment that boots next is index 0: libostree ends its title with ":0)" and gives it
+# the highest "version". Same rule googlebook-pack-slotb packs by (bls_default_entry), so
+# picking any other entry leaves Slot B packed for a deployment ostree does not boot.
+ENTRY=$(grep -l ':0)[[:space:]]*$' "$SYSROOT"/boot/loader/entries/*.conf | head -1)
+[ -n "$ENTRY" ] || ENTRY=$(grep -H '^version ' "$SYSROOT"/boot/loader/entries/*.conf \
+                           | sort -t' ' -k2 -n | tail -1 | cut -d: -f1)
 OSTREE_ARG=$(sed -n 's/^options .*ostree=\([^ ]*\).*/\1/p' "$ENTRY" | head -1)
 DEPLOY=$(readlink -f "$SYSROOT$OSTREE_ARG")   # the deployment that entry actually boots
-echo "$DEPLOY"
+STATEROOT=$(dirname "$(dirname "$DEPLOY")")
+echo "$ENTRY -> $DEPLOY"
 ```
 
-Then bind-mount and chroot as in section 3 and run `googlebook-pack-slotb`.
+Resolve it this way rather than matching the hash from a boot message against
+`/ostree/deploy/*/deploy/*.0`: those are ostree *commit* checksums, while the hash in an
+`ostree=` argument or an `ostree-prepare-root` error is a **bootcsum** — a hash of the
+kernel and initramfs pair, which names the directories under `/boot/ostree` and
+`/ostree/boot.<n>/<stateroot>`. Deployments sharing a kernel share one bootcsum, and the two
+hashes never match each other.
+
+Then bind-mount and chroot as in section 3 and run `googlebook-pack-slotb`. The full
+sequence, for a machine that cannot boot Linux at all:
+
+**1. Get into Android.** Slot A is untouched by any of this. Pick **Googlebook OS** in the
+menu, or from the Fastboot screen (hold Volume Down at power-on), from your computer:
+
+```bash
+fastboot --set-active=a && fastboot reboot
+```
+
+**2. Put the Slot B installer back**, with the USB-C Ethernet adapter connected. This
+overwrites the Linux boot images, which is fine — step 7 writes them again:
+
+```bash
+./scripts/flash-slotb.sh ./slotb-installer --adb
+```
+
+**3. Boot Slot B and ssh in.** `build-slotb-installer.sh` puts `inst.text inst.sshd` on the
+command line for every Stage2 installer, so sshd is already running; the installer's text UI
+shows the DHCP address.
+
+**4. Fetch the toolkit onto the installer.** Straight from GitHub, which needs the
+repository to be public and the installer to have network — both true on the machine this
+was written from:
+
+```bash
+BRANCH=main   # or a branch carrying a fix that has not merged yet; a slash in the name is fine
+```
+
+```bash
+curl -L -o /tmp/gbdb.tar.gz "https://github.com/dsmk/googlebook-dualboot/archive/refs/heads/$BRANCH.tar.gz"
+```
+
+```bash
+mkdir -p /tmp/gbdb && tar -xzf /tmp/gbdb.tar.gz -C /tmp/gbdb --strip-components=1
+```
+
+Otherwise push a checkout from your computer with `scp -r ./googlebook-dualboot
+root@<LAPTOP_IP>:/tmp/gbdb`, or serve a tarball from the same `python3 -m http.server` that
+hosts the extracted ISO.
+
+**5. Mount the root and resolve the deployment** with the snippet above, then bind-mount as
+in section 3 and copy the checkout in where the chroot can reach it:
+
+```bash
+mkdir -p "$DEPLOY/tmp/gbdb" && cp -a /tmp/gbdb/. "$DEPLOY/tmp/gbdb/"
+```
+
+**6. Copy the compiled menu binary from the image into the checkout.** This step is not
+optional and the failure is obscure without it: `googleboot-menu/bin/googleboot-menu` is a
+build artifact excluded by `.gitignore`, so a clone or a source tarball has only
+`googleboot-scan`. `install-into-initramfs.sh` opens with `make -B … || [[ -x
+bin/googleboot-menu ]]`, the `make` fails because an image-based deployment ships no
+compiler, the fallback test then fails too, and the packer calls that installer unguarded
+under `set -euo pipefail` — so the whole pack exits before writing anything. The image's own
+binary was compiled in the Containerfile's builder stage against this exact kernel and
+glibc:
+
+```bash
+cp "$DEPLOY/usr/local/share/googlebook-dualboot/googleboot-menu/bin/googleboot-menu" "$DEPLOY/tmp/gbdb/googleboot-menu/bin/googleboot-menu"
+```
+
+```bash
+chmod 755 "$DEPLOY/tmp/gbdb/googleboot-menu/bin/googleboot-menu"
+```
+
+**7. Pack from the checkout, not from `/usr/local/bin`.** The packer takes `googleboot-scan`
+and the module sources from its own `SELF_DIR`, so running the checkout's copy puts the
+checkout's boot menu into the Slot B initramfs even though the deployed image still carries
+an older one:
+
+```bash
+chroot "$DEPLOY" env TMPDIR=/tmp /tmp/gbdb/bin/googlebook-pack-slotb
+```
+
+**8. Check the packed command line against the entry before rebooting.** The packer prints
+`cmdline:`; its `ostree=` has to match this exactly, `boot.<n>` included:
+
+```bash
+chroot "$DEPLOY" grep -h '^options' /boot/loader/entries/*.conf | tr ' ' '\n' | grep '^ostree='
+```
+
+**9. Rebuild the image to make it stick.** A recovery pack from a checkout fixes the
+initramfs on the device, but `googlebook-slotb-sync` runs `/usr/local/bin/googlebook-pack-slotb`,
+whose `SELF_DIR` is the deployed image's toolkit — so the next automatic repack reinstalls
+the image's older `googleboot-scan`. The checkout only holds until the next upgrade triggers
+one.
 
 **Slot B boots, but into the pre-migration OS instead of the bootc deployment.** This one
 has no error message anywhere, which is what makes it confusing. `bootc install
@@ -959,6 +1128,34 @@ ls "$DEPLOY"/usr/lib/modules/*/extra/
 
 `GOOGLEBOOK_ALLOW_NO_FB=1` overrides the refusal, but only do that if you have another way
 in — it will boot blind.
+
+**`cp: cannot remove '/boot/slotb-backup/boot_b.img': Read-only file system`, and then
+Slot B re-packs on every boot.** bootc mounts `/boot` read-only. The pack itself is fine —
+the three partitions are written and sha256-verified before this step, and the log says so:
+
+```
+[googlebook-slotb] wrote boot_b.img -> /dev/nvme0n1p14
+```
+
+What is lost is the recovery backup, and — the part that bites — the stamp.
+`googlebook-slotb-sync` writes `/var/lib/googlebook/slotb.stamp` only after the packer
+returns 0, so an unguarded failure here leaves the stamp stale and the `.path` unit
+re-packs from scratch at every boot, a couple of minutes each time, for a pack that
+succeeded.
+
+The packer now remounts `/boot` rw for the backup, restores it to read-only afterwards, and
+treats a backup it cannot save as a warning rather than a failed pack. On a machine that
+hit this before the fix, clear the stale stamp by hand:
+
+```bash
+sudo mount -o remount,rw /boot && sudo googlebook-slotb-sync --force
+```
+
+Then check `cat /var/lib/googlebook/slotb.stamp` against the live fingerprint:
+
+```bash
+{ cat /boot/loader/entries/*.conf; ls -1 /boot/ostree; } | sha256sum
+```
 
 **`googlebook-slotb-sync` never fires.** It is conditioned on `/run/ostree-booted`, so it is
 inert on a package-based system by design. On a deployment, check both units:

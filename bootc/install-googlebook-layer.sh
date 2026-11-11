@@ -153,6 +153,12 @@ ln -sf /usr/local/bin/googlebook-switch-slot /usr/local/bin/boot-android
 # COPY keeps the source modes, so the toolkit's own scripts are already 0755; this only
 # makes sure nothing in the tree is unreadable to a non-root user.
 chmod -R a+rX "${TOOLKIT}"
+# Assert it took. A COPY that lands 0700 directories, or a dropped chmod, makes the whole
+# toolkit root-only - and the one thing that reads it as a normal user is the docs tree the
+# slotb-sync unit points its Documentation= at, so the failure is silent.
+unreadable=$(find "${TOOLKIT}" \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print -quit)
+[[ -z "$unreadable" ]] \
+  || { echo "FATAL: ${unreadable} is not readable by a non-root user after chmod -R a+rX" >&2; exit 1; }
 
 # --- hwdb: fold the Moonstone Vivaldi keymap into the image's binary index -------------
 # udev looks for /etc/udev/hwdb.bin before /usr/lib/udev/hwdb.bin, and the base image

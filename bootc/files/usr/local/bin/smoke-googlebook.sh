@@ -171,6 +171,13 @@ else
   check "ostree deployment marker" test -f /run/ostree-booted
   check "an ostree boot entry carries ostree=" \
     sh -c 'grep -qs "ostree=" /boot/loader/entries/*.conf'
+  # The packer saves the listing of the archive it wrote. This is the only check here that
+  # covers the Slot B image actually on the device rather than the inputs to the next pack.
+  if [ -f /boot/slotb-backup/initramfs.list ]; then
+    check "packed Slot B initramfs runs ostree-prepare-root" \
+      grep -qE 'initrd-root-fs\.target\.(wants|requires)/ostree-prepare-root\.service' \
+      /boot/slotb-backup/initramfs.list
+  fi
   check "slotb-sync state directory" test -d /var/lib/googlebook
   # An in-place migration can leave files in /etc with no SELinux label. Confined domains
   # cannot even getattr an unlabeled_t file, so this surfaces as "Permission denied" from

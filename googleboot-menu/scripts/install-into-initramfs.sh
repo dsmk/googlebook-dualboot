@@ -54,14 +54,26 @@ cat > "$RD_DIR/etc/systemd/system/googleboot-menu.service" << 'EOF'
 Description=GoogleBook Moonstone Graphical kexec Boot Menu
 DefaultDependencies=no
 After=systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service
-Before=cryptsetup-pre.target cryptsetup.target initrd-switch-root.target dracut-initqueue.service
-# Stop as part of the switch-root transaction. This unit is Type=oneshot with
-# RemainAfterExit=yes, so without Conflicts= it is still *active* when systemd serializes
-# its state across switch-root. The new root has no fragment for it - it only ever existed
-# inside the ramdisk - so systemd re-reads it as not-found and parks it in `systemctl
-# --failed` on every single boot, where it fails smoke-base-system.sh and buries any real
-# failure next to it. Conflicts= is the standard dracut idiom for this; dracut-initqueue.service
-# and friends all carry it.
+# The last three Before= entries are what actually gate this boot, and leaving them out cost
+# the menu its countdown. With root=UUID= on the command line and the NVMe driver already in
+# rd.driver.pre, systemd-fstab-generator mounts sysroot itself and dracut-initqueue never
+# runs at all - so ordering before initqueue gated nothing. sysroot mounted about a second
+# in, initrd-root-fs.target was reached, and initrd-cleanup.service isolated
+# initrd-switch-root.target, which STOPS every unit not part of that target regardless of
+# ordering: the menu died on SIGTERM at 1.07s with its 5-second timer still running and the
+# selector flashed up unreadably. Before=initrd-switch-root.target does not help, because an
+# isolate is not an ordering question. Measured on Moonstone; it only looked fine while a
+# stale ostree= kept sysroot from mounting at all, which let the menu outlive the boot.
+Before=cryptsetup-pre.target cryptsetup.target initrd-switch-root.target dracut-initqueue.service initrd-cleanup.service sysroot.mount initrd-root-fs.target
+# And stop as part of the switch-root transaction, which is a different problem from the
+# ordering above: this unit is Type=oneshot with RemainAfterExit=yes, so without Conflicts=
+# it is still *active* when systemd serializes its state across switch-root. The new root
+# has no fragment for it - it only ever existed inside the ramdisk - so systemd re-reads it
+# as not-found and parks it in `systemctl --failed` on every single boot, where it fails
+# smoke-base-system.sh and buries any real failure next to it. Conflicts= is the standard
+# dracut idiom for this; dracut-initqueue.service and friends all carry it. The two fixes
+# are independent: ordering alone leaves the unit listed as failed, Conflicts= alone leaves
+# the menu with a one-second life.
 Conflicts=initrd-switch-root.target
 
 [Service]

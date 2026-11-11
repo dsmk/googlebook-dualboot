@@ -100,12 +100,22 @@ LABEL org.opencontainers.image.description="Depthcharge Slot B bootable Fedora b
 # `bootc container lint` - the last step of this build - reports all four. The base image
 # lints clean, so without this the only lint warnings in the image would be ones this
 # layer added.
-RUN dnf -y install kexec-tools gdisk \
+# ostree is in that list for a different reason. A deployment mounts /usr through
+# ostree-prepare-root, which reaches the Slot B initramfs only through the dracut "ostree"
+# module, and both live in the ostree *package*. A trimmed base satisfies bootc with
+# ostree-libs alone - bootc links against libostree, so the image builds, `bootc container
+# lint` passes, the install deploys and boots, and nothing mounts /usr. Observed here as
+# "package ostree is not installed" inside a deployment that had /ostree/deploy and boot
+# entries carrying ostree=, and no /usr/lib/ostree at all. The ostree-prepare-root check on
+# the last line is the cheap half of catching that; install-googlebook-layer.sh checks the
+# dracut module and the unit too.
+RUN dnf -y install ostree kexec-tools gdisk \
     && dnf clean all \
     && rm -rf /run/dnf /var/lib/dnf/repos \
     && rm -f /var/log/dnf*.log /var/cache/ldconfig/aux-cache \
     && command -v kexec >/dev/null \
-    && command -v sgdisk >/dev/null
+    && command -v sgdisk >/dev/null \
+    && test -x /usr/lib/ostree/ostree-prepare-root
 
 
 # The toolkit goes to /usr/local/share rather than /var/usrlocal: on fedora-bootc
