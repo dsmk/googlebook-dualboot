@@ -824,7 +824,12 @@ sudo reboot
 
 `googlebook-slotb-sync` does this itself when `/run/ostree/staged-deployment` exists, so the
 automatic repack from the `.path` unit gets it right too; the sequence above is only needed
-when driving a pack by hand. The one case it cannot help is a pack run from an installer
+when driving a pack by hand. `googleboot-scan` also no longer treats every difference
+alike: when the packed and entry paths differ *only* in `/ostree/boot.<n>` they name the
+same deployment, so it mounts the root read-only, checks whether the packed path still
+resolves, and boots direct when it does — which is correct, and skips the kexec entirely.
+ostree removes the tree for the version it flipped away from, so that check often says no;
+when it does, the fallback runs as before and the console says which of the two it was. The one case it cannot help is a pack run from an installer
 chroot, where there is no systemd to stop the unit — finalize from the booted system before
 you reboot into trouble, not after.
 
