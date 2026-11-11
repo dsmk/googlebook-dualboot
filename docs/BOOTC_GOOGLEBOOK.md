@@ -84,8 +84,16 @@ Checked against a real ostree deployment and the built image:
   `vermagic`, and resolve through `modprobe` after `depmod`.
 - The Moonstone hwdb entry resolves via `systemd-hwdb query`.
 
-**Not yet verified:** an end-to-end boot of this image on the Googlebook. The Slot B pack
-itself has only been exercised on the package-based Fedora Server install.
+**Verified end to end on 2026-11-09**, on the real machine: a from-scratch Path B install
+onto `/dev/nvme0n1` (p11 ext4 `/boot`, p32 Btrfs `subvol=root`), packed from the installer
+and booted through Depthcharge into GNOME. `smoketests-all.sh` run as root on the deployment
+passes, including the six runtime checks that only execute on a real deployment - ostree
+marker, an `ostree=` boot entry, the slotb-sync state directory, no unlabeled files in
+`/etc`, no `/etc/udev/hwdb.bin` shadowing the `/usr` index, and `systemd-hwdb-update` not
+failed.
+
+That run is also where every correction in Path B below came from. Read it before starting:
+nearly all of them fail in ways that look like something else.
 
 ---
 
@@ -263,33 +271,203 @@ subvolume is untouched, so Fedora Server comes straight back.
 
 ## 4. Path B — Installing From Scratch
 
-Use this for a new or wiped disk. Follow
+Use this for a new or wiped disk, or to replace an existing bootc deployment. Follow
 [README Step 1](../README.md#step-1-boot-the-slot-b-installer) and
 [Step 2](../README.md#step-2-prepare-unallocated-space-1-tb--2-tb-nvme-upgrade-or-stock-512-gb-ssd)
 unchanged to boot the Slot B installer and free up space, then — instead of running
-anaconda — partition and install the image directly:
+anaconda — install the image directly.
+
+This whole section is written from a run that worked. Every step that looks like
+belt-and-braces is there because skipping it produced an error that pointed somewhere else.
+
+### Step 0 — what the installer environment will fight you about
+
+The anaconda stage2 runtime is a RAM overlay with no podman. Install it
+(`dnf -y install podman`; if no repos are configured, add
+`--repofrompath=f44,https://download.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/ --nogpgcheck`).
+
+Then move **three** separate locations off the RAM disk, or the ~8 GB pull fills it. Each
+one fails at a different step with a different message, so they are easy to fix one at a
+time and conclude you are done:
+
+| Location | Default | Symptom if left in RAM |
+|---|---|---|
+| podman graphroot | `/var/lib/containers` | `no space left on device` writing a blob |
+| podman runroot | `/run/containers/storage` | `no space left on device` on `.tmp-mountpoints.json` |
+| containers/image blob staging | `/var/tmp` | `storing blob to file "/var/tmp/container_images_storage…"` |
+
+The blob staging one is the least obvious: `tmpdir.TemporaryDirectoryForBigFiles()` defaults
+to `/var/tmp`, not `/tmp`, and ignores where the graphroot lives.
+
+Put the scratch space on the target disk at the Btrfs **top level**, as a sibling of the
+`root` subvolume — so it is invisible from the installed system and cannot be caught by a
+wipe of the target. Do **not** mount it under `/run`: if that mount silently fails, the
+bind below redirects 8 GB straight back into RAM.
+
+```bash
+mkdir -p /ctr
+mount -o subvolid=5 /dev/nvme0n1p32 /ctr
+findmnt /ctr                      # MUST name /dev/nvme0n1p32 — stop if it does not
+
+btrfs subvolume create /ctr/scratch
+mkdir -p /ctr/runroot /ctr/tmp /var/lib/containers
+mount --bind /ctr/scratch /var/lib/containers
+mount --bind /ctr/tmp     /var/tmp
+export TMPDIR=/ctr/tmp
+
+findmnt -no SOURCE,TARGET /var/lib/containers /var/tmp /ctr    # all three: nvme0n1p32
+```
+
+### Step 1 — filesystems
 
 ```bash
 # ext4 /boot on partition 11, Btrfs root on partition 32, as the toolkit expects.
-sudo mkfs.ext4 -L boot /dev/nvme0n1p11
-sudo mkfs.btrfs -f -L fedora /dev/nvme0n1p32
-sudo mount /dev/nvme0n1p32 /mnt
-sudo btrfs subvolume create /mnt/root
-sudo umount /mnt
-sudo mount -o subvol=root /dev/nvme0n1p32 /mnt
-sudo mkdir -p /mnt/boot
-sudo mount /dev/nvme0n1p11 /mnt/boot
-
-sudo podman run --rm --privileged --pid=host \
-  --security-opt label=disable \
-  -v /var/lib/containers:/var/lib/containers \
-  -v /dev:/dev -v /mnt:/mnt \
-  ghcr.io/dsmk/bootc-image-googlebook:main \
-  bootc install to-filesystem --root-ssh-authorized-keys /dev/null /mnt
+mkfs.ext4 -L boot /dev/nvme0n1p11
+mkfs.btrfs -f -L fedora /dev/nvme0n1p32
+mount /dev/nvme0n1p32 /mnt
+btrfs subvolume create /mnt/root
+umount /mnt
+mount -o subvol=root /dev/nvme0n1p32 /mnt
+mkdir -p /mnt/boot
+mount /dev/nvme0n1p11 /mnt/boot
+ls -A /mnt                        # exactly: boot
 ```
 
-Then pack Slot B exactly as in Path A step 3, with `DEPLOY` under `/mnt/ostree/deploy/...`
-and `/mnt` bind-mounted at `$DEPLOY/sysroot` instead of `/`.
+Replacing an existing deployment rather than starting clean? Recreate the subvolume instead
+of reaching for `--replace wipe` — see "Why not `--replace`" below:
+
+```bash
+umount /mnt/boot /mnt
+btrfs subvolume list /ctr                 # delete nested subvolumes first if any
+btrfs subvolume delete /ctr/root
+btrfs subvolume create /ctr/root
+# then mount and empty /boot as above
+```
+
+### Step 2 — install
+
+```bash
+mkdir -p /run/keys && cat > /run/keys/authorized_keys <<'EOF'
+ssh-ed25519 AAAA...your key...
+EOF
+
+podman --runroot /ctr/runroot run --rm --privileged --pid=host \
+  --network=host \
+  --security-opt label=disable \
+  -v /var/lib/containers:/var/lib/containers \
+  -v /dev:/dev -v /mnt:/target -v /run/keys:/run/keys \
+  ghcr.io/dsmk/bootc-image-googlebook:main \
+  bootc install to-filesystem \
+    --bootloader none \
+    --skip-finalize \
+    --root-ssh-authorized-keys /run/keys/authorized_keys \
+    /target
+```
+
+Four things in that command are not optional:
+
+- **`-v /mnt:/target` and `/target`, not `/mnt`.** `/mnt` in the image is a symlink to
+  `var/mnt`, and a bootc image ships an empty `/var`. crun resolves the bind target through
+  the symlink, lands on a path that does not exist, and fails with
+  `crun: creating '/mnt': openat2 'mnt': No such file or directory: OCI runtime attempted to
+  invoke a command that was not found` — which reads like a missing binary and is not.
+  `/target` is created at the rootfs root instead, and is bootc's own convention.
+- **`--bootloader none`.** This machine has no ESP and no GRUB; Depthcharge loads the kernel
+  from the Android boot partitions, which is what `googlebook-pack-slotb` writes. The image
+  takes the same position itself —
+  [`install-googlebook-layer.sh`](../bootc/install-googlebook-layer.sh) masks
+  `bootloader-update.service` for this reason. Without the flag, bootupd goes looking for an
+  ESP, and the one on this disk is the factory `EFI-SYSTEM` on p12, which must not be
+  touched.
+- **`--skip-finalize`.** Finalize runs `fstrim` and then remounts the target read-only, and
+  it cannot remount a bind-mounted `/target` that has `/target/boot` nested under it:
+  `mount: /target: mount point is busy`. The deployment is fully written by then — the
+  failure is in the last step, after `Deploying container image...done` — so the only effect
+  of hitting it is a nonzero exit and a confusing error. You unmount and reboot anyway.
+- **`--network=host`.** netavark needs nftables, which the Slot B installer's kernel does not
+  have: `netavark: nftables error: "nft" did not return successfully`. The image is already
+  local by this point, so `--net=none` works equally well.
+
+### Step 3 — pack Slot B
+
+Exactly as in Path A step 3, with `DEPLOY` under `/mnt/ostree/deploy/...`, `/mnt/boot` bound
+at `$DEPLOY/boot` and `/mnt` bound at `$DEPLOY/sysroot` instead of `/`. Two differences:
+
+```bash
+TMPDIR=/var/tmp chroot "$DEPLOY" /usr/local/bin/googlebook-pack-slotb 2>&1 | tee /ctr/pack.log
+```
+
+- **Reset `TMPDIR`.** The one exported in step 0 points at `/ctr/tmp`, which does not exist
+  inside the chroot, and the packer's `mktemp -d` inherits it:
+  `mktemp: failed to create directory via template '/ctr/tmp/tmp.XXXXXXXXXX'`.
+- **`tee` the output.** The packer's work directory is removed by an `EXIT` trap, so its
+  dracut log exists only in that output. On success it also lands in `/boot/slotb-backup/`.
+
+The `restorecon -Rv /etc` step from Path A does **not** apply here; a fresh install labels
+correctly, and `smoke-googlebook.sh` asserts it afterwards.
+
+Before rebooting, check the `options` line of `/mnt/boot/loader/entries/ostree-1.conf`
+carries `rootflags=subvol=/root` next to `root=UUID=…` and `ostree=…`. Without it the
+initramfs mounts the Btrfs top level, `/ostree` is not there, and it will not boot.
+
+### Step 4 — teardown
+
+Order matters; the scratch tree has to go before the filesystem holding it is unmounted.
+
+```bash
+cp /ctr/pack.log /mnt/boot/slotb-backup/
+
+umount "$DEPLOY/sysroot" "$DEPLOY/boot" "$DEPLOY/var"
+for p in run sys proc dev; do umount -R "$DEPLOY/$p"; done
+
+umount /var/tmp /var/lib/containers
+btrfs subvolume delete /ctr/scratch
+rm -rf /ctr/tmp /ctr/runroot
+umount /ctr /mnt/boot /mnt
+sync && reboot
+```
+
+Packing overwrote Slot B, so the network installer is gone — if it does not boot, recovery is
+reflashing the installer over fastboot. First boot has no user accounts and a locked root
+password; gdm hands off to `gnome-initial-setup` to create one, and the SSH key injected in
+step 2 is the fallback.
+
+### Why not `--replace`
+
+`--replace wipe` refuses a target that has anything mounted underneath it —
+`Found unexpected mount point "boot"` — and it has already run the wipe by the time it says
+so. `--replace alongside` is built for converting a *non*-ostree host and has no defined
+behaviour over an existing ostree sysroot whose stateroot is also named `default`. Emptying
+the filesystems yourself (step 1) and using the plain `to-filesystem` is both predictable and
+less typing.
+
+Its emptiness check tolerates mount points and `lost+found` and nothing else, reporting one
+offender at a time: `Requiring directory contains only mount points: Found empty directory:
+dev`. A leftover directory that `rm -rf` could not remove is usually still a mount point in
+some namespace — `grep /mnt/dev /proc/*/mountinfo` finds the holder.
+
+### Why not `ostree container image deploy`
+
+It looks like the offline equivalent of `bootc switch`, and it is — for images that qualify.
+These do not:
+
+```
+Image contains non-ostree compatible file paths: .wh.dnf: 1 ... googlebook-stage: 41 ...
+```
+
+That scan covers **every layer**, and a whiteout in a later layer does not retract a file
+from an earlier one. There is no flag to relax it. Part of the list was this layer's own
+`/tmp` staging, since fixed by bind-mounting the trees from the builder stage instead of
+`COPY`ing them — but the rest comes from the base image, where `find /var -mindepth 1
+-delete` runs in a later `RUN` than the `dnf install` whose `/var` content it removes. So the
+route cannot be reopened from this repository. Use `bootc install to-filesystem`, whose
+derived-image import filters those paths rather than rejecting them.
+
+`bootc switch` is not an option from the installer either: it resolves the deployment to act
+on from the `ostree=` argument in `/proc/cmdline`, and carries
+`Not booted into an ostree deployment` and `Detected container; this command requires a
+booted host system.` for the two ways of trying. Mounting the target at `/sysroot` does not
+change that.
 
 `/boot` **must** be ext4 or vfat: `googleboot-scan` only considers devices that `blkid`
 reports as one of those two when it looks for the boot partition.
@@ -488,6 +666,68 @@ grep -c coreboot /usr/lib/modules/$(uname -r)/modules.dep
 
 Unlike the package-based path, these cannot be missing from a successfully built image —
 the build fails first — so suspect the pack rather than the image.
+
+**Pack fails with `initramfs is missing composefs module(s):
+ostree-prepare-root.service(initrd-root-fs.target.wants)`,** while the same output reports
+`erofs` and `overlay` as present and a `dracut-install` probe that exits 0. Nothing is wrong
+with the modules — the `ostree` *dracut module* was not included, so there is no unit to
+mount `/usr` as a composefs.
+
+`50ostree`'s `check()` returns 255, which in dracut means "available, include only when
+asked". The ask has to come from an `add_dracutmodules` line in some `dracut.conf.d` file.
+It used to come from the base image's `20-bootc-base.conf`; a base rebuild replaced that
+drop-in set with rpm-ostree's `20-atomic-*.conf` files, which request `tpm2-tss` and nothing
+else, and dracut then builds a perfectly valid initramfs that cannot act on `ostree=`.
+
+```bash
+# in the deployment (chroot or booted)
+ls /usr/lib/dracut/dracut.conf.d/
+grep -rn add_dracutmodules /usr/lib/dracut/dracut.conf.d/ /etc/dracut.conf.d/
+```
+
+No line naming `ostree` confirms it. `92-googlebook-bootc.conf` now carries that request and
+[`install-googlebook-layer.sh`](../bootc/install-googlebook-layer.sh) fails the build without
+it, so this should not recur — but on an older image, drop a local override and re-pack:
+
+```bash
+printf '%s\n' 'add_dracutmodules+=" ostree bootc "' \
+  > /etc/dracut.conf.d/93-googlebook-force-ostree.conf
+```
+
+`93-` sorts after `92-` and is a basename the packer never writes, so it will not be shadowed
+at pack time, and in `/etc` it survives `bootc upgrade` through ostree's 3-way merge.
+
+This failure mode is why the packer asserts the symlink rather than just the modules. Without
+the unit there is nothing to fail: systemd mounts `root=` from the command line and
+switch-roots into the bare subvolume, booting the wrong userspace or none, with nothing
+logged anywhere.
+
+**A blunter version of the same failure: the image has no `ostree` package at all.** `bootc`
+links against `libostree`, so a trimmed base carrying only `ostree-libs` satisfies it — the
+image builds, `bootc container lint` passes, the install deploys, `/ostree/deploy` and
+`ostree=` boot entries all appear, and `/usr/lib/ostree` does not exist. Seen on this machine
+as `package ostree is not installed` inside a deployment that looked entirely healthy. Check a
+base before building on it:
+
+```bash
+podman run --rm ghcr.io/dsmk/bootc-image-laptop:main \
+  sh -c 'rpm -q ostree; ls -d /usr/lib/dracut/modules.d/*ostree'
+```
+
+[`bootc/Containerfile`](../bootc/Containerfile) now installs `ostree` itself rather than
+trusting the base for it, and `googlebook-pack-slotb` passes `--force-add ostree` so a pack
+does not depend on the deployment's own `dracut.conf.d` doing the asking. Note what the
+symptom is *not*: `erofs` and `overlay` are reported present and probe-installable
+throughout, because they arrive through `instmods` and never needed the module.
+
+**`googleboot-menu.service` listed as `not-found failed` in `systemctl --failed`.** Cosmetic,
+and fixed in images built after 2026-11-09. The unit only ever exists inside the ramdisk; it
+is `Type=oneshot` with `RemainAfterExit=yes`, so it was still active when systemd serialized
+its state across switch-root, and the real root has no fragment for it.
+`install-into-initramfs.sh` now gives it `Conflicts=initrd-switch-root.target` so it is
+stopped as part of that transaction. On an older image, `systemctl reset-failed
+googleboot-menu.service` clears it until the next boot; it fails `smoke-base-system.sh`,
+which treats any entry in `systemctl --failed` as a failure.
 
 **Dracut emergency shell, `Could not find ostree=` or a missing root.** The packed command
 line lost its `ostree=` argument. Print what Slot B is actually carrying:
@@ -786,71 +1026,6 @@ field:
   does not take the second with it (verified: with a deliberately unresolvable name in
   `add_drivers`, the `filesystems+=` copies still land)
 - a pack-time refusal that lists the generated archive and checks both are in it
-
-**`ERROR: initramfs is missing composefs module(s):
-ostree-prepare-root.service(initrd-root-fs.target.wants)`, with `erofs` and `overlay` both
-reported present.** A different fault from the one above, and the modules are a red
-herring — the missing item is the unit symlink, which only the dracut `ostree` module
-installs. Dracut built the initramfs without that module.
-
-The usual cause is packing from an installer or live environment.
-`googlebook-pack-slotb` runs dracut `--hostonly`, and a module's `check()` probes the
-*running* system — which inside a chroot is the installer, with its `/run` and `/proc`
-bind-mounted in. That is not an ostree boot, so the module is dropped. The packer's own
-detection does not notice, because it falls back to `/ostree/deploy`
-([`bin/googlebook-pack-slotb:34`](../bin/googlebook-pack-slotb)).
-
-This failure is worse than a boot failure. With no `ostree-prepare-root.service` there is
-no `OnFailure=emergency.target` and nothing to fail: systemd mounts `root=`/`rootflags=`
-from the command line and switch-root lands in the bare subvolume. If that subvolume still
-holds a pre-migration OS, the machine boots it, successfully, with nothing logged — the
-same end state as the section above on booting the pre-migration OS, reached by a different
-route.
-
-There is a blunter cause, and it is the one that hit this machine: the deployed image had
-no `ostree` **package**. `bootc` links against `libostree`, so a trimmed base that carries
-only `ostree-libs` satisfies it — the image builds, `bootc container lint` passes, the
-install deploys, `/ostree/deploy` and `ostree=` boot entries all appear, and `/usr/lib/ostree`
-does not exist. Check a base before building on it:
-
-```bash
-podman run --rm ghcr.io/dsmk/bootc-image-laptop:main \
-  sh -c 'rpm -q ostree; ls -d /usr/lib/dracut/modules.d/*ostree'
-```
-
-[`bootc/Containerfile`](../bootc/Containerfile) now installs `ostree` itself rather than
-trusting the base for it. Note what the symptom was *not*: the packer reported missing
-composefs modules while `erofs` and `overlay` were both present and probe-installable,
-because those arrive through `instmods` and never needed the module.
-
-The module is now pinned along the same three independent paths `erofs` and `overlay` are:
-
-- [`92-googlebook-bootc.conf`](../bootc/configs/usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf)
-  names `ostree` in `add_dracutmodules` **and** `force_add_dracutmodules`. `--force-add` is
-  dracut's documented override for modules that `-H` probing would drop, so it survives the
-  chroot case and a base image that stops carrying `20-bootc-base.conf`. `bootc` is left to
-  the base image's own drop-in: its module name is the base's to define, and a force-add
-  dracut cannot resolve fails the whole run.
-- `googlebook-pack-slotb` passes `--force-add ostree` itself whenever it detects an ostree
-  deployment and finds the module under `/usr/lib/dracut/modules.d`. A deployment made from
-  an older image is therefore packable without editing anything on it. If the module is not
-  there, the packer refuses before building rather than after, and says why.
-- `install-googlebook-layer.sh` fails the build when the module, the
-  `/usr/lib/ostree/ostree-prepare-root` binary, or the force-add line is missing, and
-  `smoke-googlebook.sh` re-checks all three — plus, on a booted deployment,
-  `/boot/slotb-backup/initramfs.list`, which is the listing of the image actually on the
-  device rather than of the inputs to the next pack.
-
-The pack-time assertion now accepts the symlink in either `initrd-root-fs.target.wants` or
-`initrd-root-fs.target.requires`, since ostree has used both.
-
-If the packer still refuses, read its diagnosis: it prints the module directory it found
-and every line the dracut log has about `ostree`, which separates "no module to install"
-from "a module dracut refused". No module directory at all means the deployed image is
-incomplete — rebuild it from [`bootc/Containerfile`](../bootc/Containerfile). Do not
-hand-copy a dracut module into a deployment's `/usr`, writable though it is from a chroot:
-the checkout is hardlinked into `/ostree/repo`, and editing a file in place corrupts that
-object for every deployment sharing it.
 
 **The packer also now checks dracut's exit status.** It previously ran
 

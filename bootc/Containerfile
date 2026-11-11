@@ -6,7 +6,9 @@
 #   podman build -f bootc/Containerfile -t ghcr.io/dsmk/bootc-image-googlebook:main .
 #
 # See docs/BOOTC_GOOGLEBOOK.md for how to deploy the result onto Slot B.
+#ARG BASE_IMAGE=ghcr.io/dsmk/bootc-image-laptop:main
 ARG BASE_IMAGE=ghcr.io/dsmk/bootc-image-laptop:main
+
 
 ###############################################################################
 # Stage 1 - compile against the base image's own kernel
@@ -26,6 +28,7 @@ FROM ${BASE_IMAGE} AS build
 RUN KVER="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' kernel-core)" \
     && printf '%s' "$KVER" > /kver \
     && dnf -y install "kernel-devel-${KVER}" gcc make zlib-ng-compat-devel \
+    && mkdir -p /src \
     && dnf clean all
 
 COPY coreboot-mods   /src/coreboot-mods
@@ -54,6 +57,19 @@ RUN set -eux; \
     make -C /src/googleboot-menu; \
     cp /src/googleboot-menu/bin/googleboot-menu /out/bin/
 
+# The trees stage 2 installs from, parked in this throwaway stage so they can be bind-mounted
+# rather than COPYed into the shipped image. They go here, after the compile, so editing a
+# config does not invalidate the kernel-module build above.
+#
+# Why not bind-mount them straight from the build context: under rootless podman a context
+# bind mount loses file permissions. Directories arrive intact but every regular file in the
+# mount comes through as `-?????????` and reads fail with EACCES - verified against this
+# repo. COPY maps ownership correctly, and a COPY into a stage that is thrown away costs
+# nothing in the final image.
+COPY bootc/configs /stage/configs
+COPY bootc/files   /stage/files
+COPY --chmod=0755 bootc/install-googlebook-layer.sh /stage/install-googlebook-layer.sh
+
 ###############################################################################
 # Stage 2 - the Googlebook image
 ###############################################################################
@@ -62,32 +78,45 @@ FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.title="Fedora bootc for Acer Googlebook 14 (Moonstone)"
 LABEL org.opencontainers.image.description="Depthcharge Slot B bootable Fedora bootc image for the Acer Googlebook 14 GP714-91N (board Moonstone / Google_Fatcat)"
 
-# Almost nothing to install: dracut, mkbootimg, kexec, sgdisk and zstd - everything the
-# packer needs - are already in the base image. keyd would belong here too, but Fedora 44
-# does not package it (only the unrelated keydb), so the Vivaldi top row is handled by
-# 61-googlebook-moonstone.hwdb plus the EVIOCSKEYCODE pass in googlebook-gpu-init.
-# /etc/keyd/cros.conf still ships, so installing keyd from COPR later needs no changes.
-
-# The exception, and it is not optional. A deployment mounts /usr through
-# ostree-prepare-root, which reaches the Slot B initramfs only through the dracut "ostree"
-# module. Both live in the ostree *package*, and a trimmed base image can satisfy bootc with
-# ostree-libs alone - bootc links against libostree and `bootc container lint` passes, so
-# the image builds, deploys and boots, and nothing mounts /usr. Observed on this machine:
-# "package ostree is not installed" inside a deployment that had /ostree/deploy, boot
-# entries carrying ostree=, and no /usr/lib/ostree at all. Slot B then packs cleanly and
-# switch-root lands in the bare subvolume, running whatever userspace was there before with
-# nothing logged anywhere.
+# The packer's toolchain. dracut, zstd, depmod, cpio and findmnt come from the base image,
+# but kexec and sgdisk are not guaranteed there - the base lives in another repository and
+# has already dropped them once, which smoke-googlebook.sh caught as "FAIL kexec available
+# / FAIL sgdisk available". They are hard dependencies of this layer, not of the base:
+#   kexec  (kexec-tools) - googlebook-pack-slotb's kernel handoff
+#   sgdisk (gdisk)       - googlebook-switch-slot and googlebook-restore-slotb, which flip
+#                          the Depthcharge priority/tries/successful attributes on
+#                          partitions 15 and 16
+# so install them here and let the layer stand on its own. Both are cheap and neither
+# pulls in a service: Fedora split kdump out of kexec-tools into kdump-utils, so
+# kexec-tools is just /usr/bin/kexec.
 #
-# Installing it here rather than asserting the base provides it, because the base is a
-# moving target and this costs one small package. install-googlebook-layer.sh then checks
-# that the dracut module, the binary and the force-add line in 92-googlebook-bootc.conf all
-# arrived, so if a future ostree package ever stops shipping the module the build fails
-# instead of producing an image whose Slot B boots the wrong userspace.
-RUN dnf -y install ostree && dnf clean all
+# keyd would belong here too, but Fedora 44 does not package it (only the unrelated
+# keydb), so the Vivaldi top row is handled by 61-googlebook-moonstone.hwdb plus the
+# EVIOCSKEYCODE pass in googlebook-gpu-init. /etc/keyd/cros.conf still ships, so
+# installing keyd from COPR later needs no changes.
+#
+# `dnf clean all` is not enough on its own: it leaves /run/dnf, /var/log/dnf5.log, the
+# per-repo countme files under /var/lib/dnf/repos and an ldconfig aux-cache behind, and
+# `bootc container lint` - the last step of this build - reports all four. The base image
+# lints clean, so without this the only lint warnings in the image would be ones this
+# layer added.
+# ostree is in that list for a different reason. A deployment mounts /usr through
+# ostree-prepare-root, which reaches the Slot B initramfs only through the dracut "ostree"
+# module, and both live in the ostree *package*. A trimmed base satisfies bootc with
+# ostree-libs alone - bootc links against libostree, so the image builds, `bootc container
+# lint` passes, the install deploys and boots, and nothing mounts /usr. Observed here as
+# "package ostree is not installed" inside a deployment that had /ostree/deploy and boot
+# entries carrying ostree=, and no /usr/lib/ostree at all. The ostree-prepare-root check on
+# the last line is the cheap half of catching that; install-googlebook-layer.sh checks the
+# dracut module and the unit too.
+RUN dnf -y install ostree kexec-tools gdisk \
+    && dnf clean all \
+    && rm -rf /run/dnf /var/lib/dnf/repos \
+    && rm -f /var/log/dnf*.log /var/cache/ldconfig/aux-cache \
+    && command -v kexec >/dev/null \
+    && command -v sgdisk >/dev/null \
+    && test -x /usr/lib/ostree/ostree-prepare-root
 
-COPY --from=build /out/extra            /tmp/googlebook-mods/extra
-COPY --from=build /out/updates          /tmp/googlebook-mods/updates
-COPY --from=build /out/bin              /tmp/googlebook-mods/bin
 
 # The toolkit goes to /usr/local/share rather than /var/usrlocal: on fedora-bootc
 # /usr/local is a real directory inside /usr, so this is immutable, verity-backed
@@ -101,11 +130,34 @@ COPY audio-mods      /usr/local/share/googlebook-dualboot/audio-mods
 COPY googleboot-menu /usr/local/share/googlebook-dualboot/googleboot-menu
 COPY docs            /usr/local/share/googlebook-dualboot/docs
 
-COPY --chmod=0644 bootc/configs/ /
-COPY --chmod=0755 bootc/files/   /
-
-COPY --chmod=0755 bootc/install-googlebook-layer.sh /tmp/install-googlebook-layer.sh
-RUN /tmp/install-googlebook-layer.sh \
-    && rm -rf /tmp/install-googlebook-layer.sh /tmp/googlebook-mods
+# NOT `COPY --chmod=0644 bootc/configs/ /`. --chmod applies the mode to directories as well
+# as files, and not only to the directories it creates - every directory on the destination
+# path is chmod'ed too. Copying this tree to / with --chmod=0644 left /usr/lib, /usr/share,
+# /usr/lib/systemd/system, /usr/lib/udev, /usr/lib/dracut and /usr/share/alsa as mode 0644:
+# directories no non-root process can traverse. Nothing in the build notices, because root
+# bypasses the check via CAP_DAC_OVERRIDE - the build, `bootc container lint` and
+# smoke-googlebook.sh all passed on an image where gdm could not read /usr/share and
+# pipewire could not read the rt721+rt1320 UCM config this layer ships.
+#
+# Stage the trees instead; install-googlebook-layer.sh places the files with explicit modes,
+# creates only the directories that are actually missing, and asserts afterwards that every
+# directory it wrote into is still traversable.
+#
+# Bind mounts, not COPY. These trees are build input - the layer script reads them and
+# installs their contents elsewhere - so there is no reason for them to exist in the shipped
+# image. As COPY layers they did: `COPY bootc/configs/ /tmp/googlebook-stage/configs/` and
+# friends wrote 54 files under /tmp, and the `rm -rf` in the next RUN only added whiteouts on
+# top. The files stayed in the layer history, where `ostree container image deploy` sees them
+# and refuses the image with "non-ostree compatible file paths: googlebook-stage: 41 ...".
+# A bind mount exists only for the duration of the RUN and leaves nothing behind.
+#
+# Needs podman/buildah with RUN --mount=type=bind (buildah 1.24+, podman 4.x+). If that ever
+# has to be given up, the fallback is to stage under /usr rather than /tmp - still bloat, but
+# at least on an ostree-compatible path. Both mounts come from the builder stage: see the
+# comment there for why not from the build context.
+RUN --mount=type=bind,from=build,source=/out,target=/run/gb-mods \
+    --mount=type=bind,from=build,source=/stage,target=/run/gb-stage \
+    STAGE=/run/gb-stage MODS=/run/gb-mods \
+    /run/gb-stage/install-googlebook-layer.sh
 
 RUN bootc container lint

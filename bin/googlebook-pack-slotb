@@ -309,14 +309,18 @@ fi
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 
-# An ostree deployment needs the dracut "ostree" module, and --hostonly is what takes it
-# away. That module's check() probes the running system, so packing from an installer or
-# live chroot - the one case where the machine cannot pack itself - shows it the installer's
-# /run and /proc rather than an ostree-booted system, and dracut drops it silently. The
-# archive check below catches the result, but only after a five-minute build; --force-add is
-# dracut's override for modules that -H probing would discard. Passed only when the module
-# is really present, because dracut fails the whole run on a force-add it cannot resolve,
-# and a module that is simply absent is a broken image - worth saying so in those words.
+# An ostree deployment needs the dracut "ostree" module, and nothing guarantees dracut will
+# include it. 50ostree's check() returns 255 - available, but included only when a
+# dracut.conf.d file names it in add_dracutmodules. That ask used to come from the base
+# image's 20-bootc-base.conf and stopped when the base swapped to rpm-ostree's
+# 20-atomic-*.conf set; 92-googlebook-bootc.conf now does the asking, but this packer also
+# runs against deployments it did not build, and from installer chroots. --force-add makes
+# the pack independent of whether anything asked. The archive check below catches a miss
+# either way, but only after a five-minute build.
+#
+# Passed only when the module is really present, because dracut fails the whole run on a
+# force-add it cannot resolve, and a module that is simply absent is a broken image - worth
+# saying so in those words rather than as a dracut error forty lines into a log.
 FORCE_ADD=()
 if (( OSTREE_DEPLOY )); then
   OSTREE_DMOD=$(ls -d /usr/lib/dracut/modules.d/*ostree 2>/dev/null | head -1)

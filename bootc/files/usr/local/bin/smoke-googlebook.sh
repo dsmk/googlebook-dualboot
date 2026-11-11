@@ -72,31 +72,61 @@ check "omit list is not shadowed by a packer-written /etc copy" \
   sh -c '! test -f /etc/dracut.conf.d/92-googlebook-bootc.conf'
 check "clevis is omitted" \
   grep -q 'clevis' /usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf
-# Only the dracut "ostree" module puts ostree-prepare-root.service into the initramfs, and
-# --hostonly probing drops it whenever a pack runs from an installer chroot. Without it Slot
-# B still boots - into the bare subvolume and the previous userspace, silently - so these
-# are checked the same way the erofs/overlay pinning is.
-check "ostree dracut module present" \
-  sh -c 'ls -d /usr/lib/dracut/modules.d/*ostree >/dev/null 2>&1'
-check "ostree-prepare-root present" \
+# --- the initramfs must be able to act on ostree= ----------------------------------------
+# 50ostree's check() returns 255: available, but included only when a dracut.conf.d file
+# names it in add_dracutmodules. The base image used to do that in 20-bootc-base.conf and
+# stopped when it swapped to rpm-ostree's 20-atomic-*.conf set - after which dracut built
+# initramfses with erofs and overlay but no ostree-prepare-root.service, and Slot B
+# switch-rooted into the bare subvolume with nothing logged. install-googlebook-layer.sh
+# asserts this at build time; re-assert it here because every link but 92-googlebook-bootc.conf
+# belongs to the base image and can move under this layer between builds.
+#
+# Shadowing is already covered: the check above asserts no /etc copy of 92 exists, and 92 is
+# the file that carries the request, so a plain scan of both directories is enough here.
+check "dracut config requests the ostree module" sh -c '
+  cat /etc/dracut.conf.d/*.conf /usr/lib/dracut/dracut.conf.d/*.conf 2>/dev/null \
+    | grep -E "^[[:space:]]*add_dracutmodules" \
+    | grep -qE "[[:space:]\"]ostree[[:space:]\"]"'
+# Requested is not enough: 50ostree returns 1 - never include - unless both of these are
+# executable, which would leave the request satisfied and the initramfs still broken.
+check "50ostree dracut module present" \
+  test -d /usr/lib/dracut/modules.d/50ostree
+check "ostree-prepare-root present (50ostree check() precondition)" \
   test -x /usr/lib/ostree/ostree-prepare-root
-check "ostree dracut module forced past hostonly probing" \
-  grep -qE 'force_add_dracutmodules.*ostree' /usr/lib/dracut/dracut.conf.d/92-googlebook-bootc.conf
-# The binary is only half of it - this unit is what the dracut module links into
-# initrd-root-fs.target.wants, and it is checkable here, in a container, where the packed
-# initramfs listing checked further down is not.
 check "ostree-prepare-root.service present (what gets linked into initrd-root-fs.target.wants)" \
   test -f /usr/lib/systemd/system/ostree-prepare-root.service
-# install-googlebook-layer.sh runs chmod -R a+rX over the toolkit; a COPY that lands 0700
-# directories would otherwise make it root-only without anything saying so.
-check "shipped directories traversable by non-root" \
-  sh -c 'test -z "$(find /usr/local/share/googlebook-dualboot \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print -quit)"'
 check "coreboot framebuffer autoload present" \
   test -f /usr/lib/modules-load.d/googlebook-coreboot-fb.conf
 check "staged Xe2 modprobe rules present" \
   test -f /usr/lib/modprobe.d/googlebook-xe-staged.conf
 check "/var/lib/googlebook tmpfiles entry present" \
   grep -q '/var/lib/googlebook' /usr/lib/tmpfiles.d/googlebook.conf
+
+# --- directories this image ships into must stay traversable by non-root -----------------
+# `COPY --chmod=0644 configs/ /` chmods directories as well as files, and not only the ones
+# it creates: it walks the destination path and leaves /usr/lib, /usr/share,
+# /usr/lib/systemd/system and friends at 0644. root is exempt (CAP_DAC_OVERRIDE), so an
+# image broken this way builds, lints and passes every root-run check while no user session
+# works on it - gdm cannot read /usr/share, pipewire cannot read the UCM config below.
+# Checked here as well as at build time because the base image is built from a separate
+# Containerfile that can reintroduce it underneath this layer at any time.
+untraversable=0
+for d in /usr /usr/lib /usr/lib/systemd /usr/lib/systemd/system /usr/lib/udev \
+         /usr/lib/udev/hwdb.d /usr/lib/dracut /usr/lib/dracut/dracut.conf.d \
+         /usr/lib/modprobe.d /usr/lib/modules-load.d /usr/lib/tmpfiles.d \
+         /usr/lib/modules /usr/lib/firmware /usr/share /usr/share/alsa \
+         /usr/local /usr/local/bin /usr/local/sbin /usr/local/share \
+         /etc /etc/yum.repos.d /etc/keyd; do
+  [ -d "$d" ] || continue
+  if [ -n "$(find "$d" -maxdepth 0 ! -perm -o=rx 2>/dev/null)" ]; then
+    echo "  FAIL $d is $(stat -c %A "$d") - not traversable by non-root"
+    untraversable=1
+    fail=1
+  fi
+done
+if [ "$untraversable" -eq 0 ]; then
+  echo "  ok   shipped directories traversable by non-root"
+fi
 
 # --- the toolkit entry points -----------------------------------------------------------
 for tool in googlebook-pack-slotb googlebook-restore-slotb googlebook-switch-slot \
