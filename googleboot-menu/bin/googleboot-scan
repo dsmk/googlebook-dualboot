@@ -539,17 +539,27 @@ boot_entry() {
           # after this line, control was handed over and the new kernel is the one that is
           # silent; if it stops before, the handoff itself is where it hung.
           echo "[googleboot-scan] handing off to the new kernel..."
-          # systemctl kexec goes first because it shuts the initramfs down cleanly, but it
-          # returns 0 as soon as PID 1 accepts the job - it does NOT block until control
-          # transfers. `systemctl kexec || kexec -e` therefore skipped the fallback in
-          # exactly the case that needed it: observed on Moonstone as both commands silent,
-          # this script carrying on, and the boot continuing into a stale ostree= path that
-          # ends in emergency mode with a locked root account. So let systemd try, give it a
-          # moment, then force it - kexec -e does not return on success, so anything after
-          # this line means the handoff genuinely did not happen.
-          systemctl kexec 2>/dev/null || true
-          sleep 3 2>/dev/null || true
+          # kexec -e goes first, deliberately. systemctl kexec is the tidier call - it
+          # shuts the initramfs down cleanly - but it has failed here twice, in two
+          # different ways, and neither failure let kexec -e run at all:
+          #   1. it returned 0 without transferring control, so `systemctl kexec || kexec -e`
+          #      skipped the fallback and the boot carried on into a stale ostree= path;
+          #   2. it blocked and never returned, so nothing after it ran either.
+          # Both measured on Moonstone, on consecutive nights. There is nothing left to shut
+          # down cleanly by this point regardless - /sysroot and the boot partition are
+          # unmounted and synced a few lines above - so make the call that either works or
+          # returns, and keep systemd as the thing that gets one bounded try afterwards.
           kexec -e || true
+          echo "[googleboot-scan] kexec -e did not take; trying systemd..." >&2
+          # Bounded, because an unbounded systemctl kexec is exactly what left the console
+          # frozen on "handing off to the new kernel..." with no way forward. timeout is
+          # coreutils and may not be here; without it, accept the risk rather than skip the
+          # attempt.
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 15 systemctl kexec 2>/dev/null || true
+          else
+            systemctl kexec 2>/dev/null || true
+          fi
           echo "[googleboot-scan] kexec did not take control; still in the Slot B initramfs" >&2
           exit 0
         fi
